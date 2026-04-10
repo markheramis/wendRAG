@@ -22,6 +22,8 @@ use crate::entity::DocumentEntityGraph;
 use crate::retrieve::ScoredChunk;
 use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount};
 
+use crate::config::PoolConfig;
+
 use super::{
     ChunkInsert, DocumentUpsert, SQLITE_MIGRATOR, SearchFilters, StorageBackend,
     connect_sqlite_pool,
@@ -46,10 +48,11 @@ pub struct SqliteBackend {
 impl SqliteBackend {
     /**
      * Connects to the SQLite database file and applies the SQLite-specific
-     * migrations.
+     * migrations. Pool size and acquire timeout are driven by the
+     * caller-provided [`PoolConfig`].
      */
-    pub async fn connect(sqlite_path: &str) -> Result<Self, sqlx::Error> {
-        let pool = connect_sqlite_pool(sqlite_path)
+    pub async fn connect(sqlite_path: &str, pool_cfg: &PoolConfig) -> Result<Self, sqlx::Error> {
+        let pool = connect_sqlite_pool(sqlite_path, pool_cfg)
             .await
             .map_err(|error| sqlx::Error::Configuration(Box::new(error)))?;
         SQLITE_MIGRATOR.run(&pool).await?;

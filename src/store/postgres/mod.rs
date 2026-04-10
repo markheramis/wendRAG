@@ -17,6 +17,8 @@ use crate::entity::DocumentEntityGraph;
 use crate::retrieve::ScoredChunk;
 use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount};
 
+use crate::config::PoolConfig;
+
 use super::{ChunkInsert, DocumentUpsert, POSTGRES_MIGRATOR, SearchFilters, StorageBackend};
 
 #[derive(Debug, Clone)]
@@ -27,11 +29,13 @@ pub struct PostgresBackend {
 impl PostgresBackend {
     /**
      * Connects to PostgreSQL, runs the pgvector migrations, and returns the
-     * backend handle shared by the rest of the application.
+     * backend handle shared by the rest of the application. Pool size and
+     * acquire timeout are driven by the caller-provided [`PoolConfig`].
      */
-    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+    pub async fn connect(database_url: &str, pool_cfg: &PoolConfig) -> Result<Self, sqlx::Error> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(pool_cfg.max_connections)
+            .acquire_timeout(pool_cfg.acquire_timeout)
             .connect(database_url)
             .await?;
         POSTGRES_MIGRATOR.run(&pool).await?;
@@ -82,6 +86,10 @@ impl StorageBackend for PostgresBackend {
         document_id: Uuid,
         chunks: &[ChunkInsert],
     ) -> Result<(), sqlx::Error> {
+        /// Rows per multi-row INSERT batch. 5 bind params per row; Postgres
+        /// supports up to 65 535 params, so 50 rows (250 params) is safe.
+        const CHUNK_BATCH_SIZE: usize = 50;
+
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
@@ -101,20 +109,18 @@ impl StorageBackend for PostgresBackend {
             .execute(&mut *tx)
             .await?;
 
-        for chunk in chunks {
-            sqlx::query(
-                r#"
-                INSERT INTO chunks (document_id, content, chunk_index, section_title, embedding)
-                VALUES ($1, $2, $3, $4, $5)
-                "#,
-            )
-            .bind(document_id)
-            .bind(&chunk.content)
-            .bind(chunk.chunk_index)
-            .bind(chunk.section_title.as_deref())
-            .bind(Vector::from(chunk.embedding.clone()))
-            .execute(&mut *tx)
-            .await?;
+        for batch in chunks.chunks(CHUNK_BATCH_SIZE) {
+            let mut builder = sqlx::QueryBuilder::new(
+                "INSERT INTO chunks (document_id, content, chunk_index, section_title, embedding) ",
+            );
+            builder.push_values(batch, |mut row, chunk| {
+                row.push_bind(document_id)
+                    .push_bind(&chunk.content)
+                    .push_bind(chunk.chunk_index)
+                    .push_bind(chunk.section_title.as_deref())
+                    .push_bind(Vector::from(chunk.embedding.clone()));
+            });
+            builder.build().execute(&mut *tx).await?;
         }
 
         tx.commit().await

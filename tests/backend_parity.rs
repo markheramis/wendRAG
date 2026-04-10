@@ -696,7 +696,8 @@ impl Drop for UrlTestServer {
 async fn sqlite_harness() -> TestResult<BackendHarness> {
     let temp_dir = tempfile::tempdir()?;
     let sqlite_path = temp_dir.path().join("code-rag.db");
-    let storage = Arc::new(SqliteBackend::connect(sqlite_path.to_str().unwrap()).await?)
+    let pool_cfg = wend_rag::config::PoolConfig::default();
+    let storage = Arc::new(SqliteBackend::connect(sqlite_path.to_str().unwrap(), &pool_cfg).await?)
         as Arc<dyn StorageBackend>;
 
     Ok(BackendHarness {
@@ -733,8 +734,9 @@ async fn postgres_harness() -> TestResult<Option<BackendHarness>> {
     let mut database_url = Url::parse(&admin_database_url)?;
     database_url.set_path(&format!("/{database_name}"));
 
+    let pool_cfg = wend_rag::config::PoolConfig::default();
     let storage =
-        Arc::new(PostgresBackend::connect(database_url.as_str()).await?) as Arc<dyn StorageBackend>;
+        Arc::new(PostgresBackend::connect(database_url.as_str(), &pool_cfg).await?) as Arc<dyn StorageBackend>;
     Ok(Some(BackendHarness {
         name: "postgres",
         project: format!("postgres-{}", Uuid::new_v4()),

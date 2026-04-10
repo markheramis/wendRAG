@@ -1,6 +1,10 @@
 use std::env;
+use std::time::Duration;
 
 use crate::entity::{DEFAULT_GRAPH_TRAVERSAL_DEPTH, GraphSettings};
+
+const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 20;
+const DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub enum EmbeddingProviderKind {
@@ -64,6 +68,27 @@ pub struct Config {
     /// Percentile (0.0..1.0) below which similarity scores become chunk breaks.
     /// E.g. 0.25 means the bottom 25% of consecutive-sentence similarities are break points.
     pub chunking_semantic_threshold: f64,
+    pub pool: PoolConfig,
+}
+
+/**
+ * Connection pool tuning knobs shared by both the PostgreSQL and SQLite
+ * backends. Parsed from `POOL_MAX_CONNECTIONS` and `POOL_ACQUIRE_TIMEOUT_SECS`
+ * environment variables with safe production defaults.
+ */
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    pub max_connections: u32,
+    pub acquire_timeout: Duration,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_POOL_MAX_CONNECTIONS,
+            acquire_timeout: Duration::from_secs(DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -188,6 +213,15 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.25);
 
+        let pool_max_connections = env::var("POOL_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_POOL_MAX_CONNECTIONS);
+        let pool_acquire_timeout_secs = env::var("POOL_ACQUIRE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS);
+
         Ok(Config {
             transport,
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
@@ -216,6 +250,10 @@ impl Config {
             graph_settings,
             chunking_strategy,
             chunking_semantic_threshold,
+            pool: PoolConfig {
+                max_connections: pool_max_connections,
+                acquire_timeout: Duration::from_secs(pool_acquire_timeout_secs),
+            },
         })
     }
 }

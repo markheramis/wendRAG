@@ -7,7 +7,7 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use uuid::Uuid;
 
-use crate::config::{Config, StorageBackendKind};
+use crate::config::{Config, PoolConfig, StorageBackendKind};
 use crate::entity::DocumentEntityGraph;
 use crate::retrieve::ScoredChunk;
 
@@ -184,11 +184,11 @@ pub async fn initialize_backend(cfg: &Config) -> Result<Arc<dyn StorageBackend>,
                 .database_url
                 .as_deref()
                 .ok_or(StoreInitError::MissingDatabaseUrl)?;
-            let backend = PostgresBackend::connect(database_url).await?;
+            let backend = PostgresBackend::connect(database_url, &cfg.pool).await?;
             Ok(Arc::new(backend))
         }
         StorageBackendKind::Sqlite => {
-            let backend = SqliteBackend::connect(&cfg.sqlite_path).await?;
+            let backend = SqliteBackend::connect(&cfg.sqlite_path, &cfg.pool).await?;
             Ok(Arc::new(backend))
         }
     }
@@ -224,14 +224,17 @@ pub(crate) fn sqlite_connect_options(
 }
 
 /**
- * Creates the SQLite pool used by the local backend.
+ * Creates the SQLite pool used by the local backend. Pool size and acquire
+ * timeout are driven by the caller-provided [`PoolConfig`].
  */
 pub(crate) async fn connect_sqlite_pool(
     sqlite_path: &str,
+    pool_cfg: &PoolConfig,
 ) -> Result<sqlx::SqlitePool, StoreInitError> {
     let options = sqlite_connect_options(sqlite_path)?;
     let pool = SqlitePoolOptions::new()
-        .max_connections(10)
+        .max_connections(pool_cfg.max_connections)
+        .acquire_timeout(pool_cfg.acquire_timeout)
         .connect_with(options)
         .await?;
     Ok(pool)

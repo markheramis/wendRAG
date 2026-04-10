@@ -684,9 +684,12 @@ mod tests {
 
     async fn make_test_server() -> (WendRagServer, tempfile::NamedTempFile) {
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let storage = SqliteBackend::connect(tmpfile.path().to_str().unwrap())
-            .await
-            .unwrap();
+        let storage = SqliteBackend::connect(
+            tmpfile.path().to_str().unwrap(),
+            &crate::config::PoolConfig::default(),
+        )
+        .await
+        .unwrap();
         let storage: Arc<dyn crate::store::StorageBackend> = Arc::new(storage);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(NoopEmbedder);
         let server = WendRagServer::new(

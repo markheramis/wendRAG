@@ -73,74 +73,78 @@ pub(crate) async fn replace_document_entity_graph(
         );
     }
 
-    for mention in &graph.mentions {
-        let Some(chunk_id) = chunk_ids_by_index.get(&mention.chunk_index).copied() else {
-            continue;
-        };
-        let Some(entity_id) = entity_ids_by_key
-            .get(&(mention.normalized_name.clone(), mention.entity_type.clone()))
-            .copied()
-        else {
-            continue;
-        };
+    /// Rows per multi-row INSERT batch for mentions and relationships.
+    const BATCH_SIZE: usize = 50;
 
-        sqlx::query(
-            r#"
-            INSERT INTO entity_mentions (chunk_id, entity_id)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(chunk_id)
-        .bind(entity_id)
-        .execute(&mut *tx)
-        .await?;
+    let resolved_mentions: Vec<(Uuid, Uuid)> = graph
+        .mentions
+        .iter()
+        .filter_map(|mention| {
+            let chunk_id = chunk_ids_by_index.get(&mention.chunk_index).copied()?;
+            let entity_id = entity_ids_by_key
+                .get(&(mention.normalized_name.clone(), mention.entity_type.clone()))
+                .copied()?;
+            Some((chunk_id, entity_id))
+        })
+        .collect();
+
+    for batch in resolved_mentions.chunks(BATCH_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "INSERT INTO entity_mentions (chunk_id, entity_id) ",
+        );
+        builder.push_values(batch, |mut row, (chunk_id, entity_id)| {
+            row.push_bind(*chunk_id).push_bind(*entity_id);
+        });
+        builder.push(" ON CONFLICT DO NOTHING");
+        builder.build().execute(&mut *tx).await?;
     }
 
-    for relationship in &graph.relationships {
-        let Some(source_entity_id) = entity_ids_by_key
-            .get(&(
-                relationship.source_normalized_name.clone(),
-                relationship.source_type.clone(),
-            ))
-            .copied()
-        else {
-            continue;
-        };
-        let Some(target_entity_id) = entity_ids_by_key
-            .get(&(
-                relationship.target_normalized_name.clone(),
-                relationship.target_type.clone(),
-            ))
-            .copied()
-        else {
-            continue;
-        };
-        let evidence_chunk_id = chunk_ids_by_index
-            .get(&relationship.evidence_chunk_index)
-            .copied();
+    struct ResolvedRelationship<'a> {
+        source_entity_id: Uuid,
+        target_entity_id: Uuid,
+        relationship_type: &'a str,
+        description: Option<&'a str>,
+        weight: f64,
+        evidence_chunk_id: Option<Uuid>,
+    }
 
-        sqlx::query(
-            r#"
-            INSERT INTO entity_relationships (
+    let resolved_relationships: Vec<ResolvedRelationship<'_>> = graph
+        .relationships
+        .iter()
+        .filter_map(|rel| {
+            let source_entity_id = entity_ids_by_key
+                .get(&(rel.source_normalized_name.clone(), rel.source_type.clone()))
+                .copied()?;
+            let target_entity_id = entity_ids_by_key
+                .get(&(rel.target_normalized_name.clone(), rel.target_type.clone()))
+                .copied()?;
+            let evidence_chunk_id = chunk_ids_by_index
+                .get(&rel.evidence_chunk_index)
+                .copied();
+            Some(ResolvedRelationship {
                 source_entity_id,
                 target_entity_id,
-                relationship_type,
-                description,
-                weight,
-                evidence_chunk_id
-            )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(source_entity_id)
-        .bind(target_entity_id)
-        .bind(&relationship.relationship_type)
-        .bind(relationship.description.as_deref())
-        .bind(relationship.weight as f64)
-        .bind(evidence_chunk_id)
-        .execute(&mut *tx)
-        .await?;
+                relationship_type: &rel.relationship_type,
+                description: rel.description.as_deref(),
+                weight: rel.weight as f64,
+                evidence_chunk_id,
+            })
+        })
+        .collect();
+
+    for batch in resolved_relationships.chunks(BATCH_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "INSERT INTO entity_relationships (source_entity_id, target_entity_id, relationship_type, description, weight, evidence_chunk_id) ",
+        );
+        builder.push_values(batch, |mut row, rel| {
+            row.push_bind(rel.source_entity_id)
+                .push_bind(rel.target_entity_id)
+                .push_bind(rel.relationship_type)
+                .push_bind(rel.description)
+                .push_bind(rel.weight)
+                .push_bind(rel.evidence_chunk_id);
+        });
+        builder.build().execute(&mut *tx).await?;
     }
 
     prune_orphan_entities(&mut tx).await?;
