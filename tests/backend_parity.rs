@@ -716,7 +716,7 @@ async fn sqlite_harness() -> TestResult<BackendHarness> {
 async fn postgres_harness() -> TestResult<Option<BackendHarness>> {
     let admin_database_url = env::var("TEST_DATABASE_URL")
         .ok()
-        .or_else(|| env::var("DATABASE_URL").ok());
+        .or_else(|| env::var("WEND_RAG_DATABASE_URL").ok());
 
     let Some(admin_database_url) = admin_database_url else {
         return Ok(None);

@@ -1,9 +1,9 @@
-use std::env;
-use std::io::{self, ErrorKind};
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
-use wend_rag::config::{Config, EmbeddingProviderKind, StorageBackendKind, TransportMode};
+use clap::{Parser, Subcommand};
+use wend_rag::config::{Config, EmbeddingProviderKind, StorageBackendKind};
+use wend_rag::config_file::FileConfig;
 use wend_rag::embed::{self, OpenAiCompatProvider};
 use wend_rag::entity::{EntityExtractor, OpenAiCompatEntityExtractor};
 use wend_rag::ingest::pipeline;
@@ -15,13 +15,28 @@ use rmcp::transport::streamable_http_server::{
 };
 use tracing_subscriber::EnvFilter;
 
-/**
- * Captures the supported one-shot CLI modes that run before the MCP server
- * transport is started.
- */
-enum CliMode {
-    Serve,
-    Ingest { path: String },
+#[derive(Parser)]
+#[command(name = "wend-rag", version, about = "wendRAG — RAG-powered MCP server")]
+struct Cli {
+    /// Path to YAML config file (default: /etc/wend-rag/config.yaml on Linux)
+    #[arg(short, long, global = true)]
+    config: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the RAG + MCP service over HTTP
+    Daemon,
+    /// One-shot document ingestion, then exit
+    Ingest {
+        /// Path to file, directory, or URL to ingest
+        path: String,
+    },
+    /// Start the MCP server over stdio transport
+    Stdio,
 }
 
 #[tokio::main]
@@ -31,17 +46,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli_mode = parse_cli_mode()?;
-    let cfg = Config::from_env()?;
-    match &cli_mode {
-        CliMode::Serve => {
+    let cli = Cli::parse();
+
+    let file_config = FileConfig::load(cli.config.as_deref());
+    let cfg = Config::load(file_config.as_ref())?;
+
+    match &cli.command {
+        Command::Daemon => {
             tracing::info!(
-                transport = ?cfg.transport,
                 backend = ?cfg.storage_backend,
-                "starting wendRAG MCP server"
+                "starting wendRAG MCP server (daemon)"
             )
         }
-        CliMode::Ingest { path } => tracing::info!(path = %path, "starting one-shot ingestion"),
+        Command::Ingest { path } => {
+            tracing::info!(path = %path, "starting one-shot ingestion")
+        }
+        Command::Stdio => {
+            tracing::info!("starting wendRAG MCP server (stdio)")
+        }
     }
 
     let storage = store::initialize_backend(&cfg).await?;
@@ -60,19 +82,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )) as Arc<dyn EntityExtractor>
         });
 
-    if let CliMode::Ingest { path } = cli_mode {
-        run_cli_ingest(
-            &storage,
-            &embedder,
-            entity_extractor.as_ref(),
-            &path,
-            cfg.chunking_strategy,
-            cfg.chunking_semantic_threshold,
-        )
-        .await?;
-        return Ok(());
+    match cli.command {
+        Command::Ingest { path } => {
+            run_cli_ingest(
+                &storage,
+                &embedder,
+                entity_extractor.as_ref(),
+                &path,
+                cfg.chunking_strategy,
+                cfg.chunking_semantic_threshold,
+            )
+            .await?;
+            Ok(())
+        }
+        Command::Daemon => {
+            let host = cfg.host.clone();
+            let port = cfg.port;
+            let server = build_server(cfg, storage, embedder, entity_extractor);
+            serve_http(server, &host, port).await
+        }
+        Command::Stdio => {
+            let server = build_server(cfg, storage, embedder, entity_extractor);
+            serve_stdio(server).await
+        }
     }
+}
 
+/**
+ * Constructs the `WendRagServer` with its public `ServerConfig` snapshot.
+ * Shared by both the daemon and stdio code paths.
+ */
+fn build_server(
+    cfg: Config,
+    storage: Arc<dyn store::StorageBackend>,
+    embedder: Arc<dyn embed::EmbeddingProvider>,
+    entity_extractor: Option<Arc<dyn EntityExtractor>>,
+) -> WendRagServer {
     let server_config = ServerConfig {
         storage_backend: match cfg.storage_backend {
             StorageBackendKind::Postgres => "postgres",
@@ -98,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunking_semantic_threshold: cfg.chunking_semantic_threshold,
     };
 
-    let server = WendRagServer::new(
+    WendRagServer::new(
         storage,
         embedder,
         entity_extractor,
@@ -106,37 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.chunking_strategy,
         cfg.chunking_semantic_threshold,
         server_config,
-    );
-
-    match cfg.transport {
-        TransportMode::Http => serve_http(server, &cfg.host, cfg.port).await,
-        TransportMode::Stdio => serve_stdio(server).await,
-    }
-}
-
-/**
- * Parses the top-level CLI flags that affect process mode while leaving the
- * existing MCP transport selection logic untouched.
- */
-fn parse_cli_mode() -> Result<CliMode, io::Error> {
-    let mut args = env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        if let Some(path) = arg.strip_prefix("--ingest=") {
-            return Ok(CliMode::Ingest {
-                path: path.to_string(),
-            });
-        }
-
-        if arg == "--ingest" {
-            let path = args.next().ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidInput, "--ingest requires a path argument")
-            })?;
-            return Ok(CliMode::Ingest { path });
-        }
-    }
-
-    Ok(CliMode::Serve)
+    )
 }
 
 /**
@@ -170,7 +185,7 @@ async fn run_cli_ingest(
 }
 
 /**
- * Starts the MCP server over Streamable HTTP transport (default).
+ * Starts the MCP server over Streamable HTTP transport (daemon mode).
  * Binds an Axum router on `host:port` with the MCP endpoint at `/mcp` and a
  * plain `/health` endpoint for systemd, load-balancers, and container probes.
  * Listens for SIGTERM / ctrl_c and drains in-flight requests before exiting.

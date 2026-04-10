@@ -1,0 +1,57 @@
+# wendRAG configuration
+# =====================
+# Copy this file to /etc/wend-rag/config.yaml and adjust values for your
+# deployment.
+#
+# This file has the HIGHEST priority in the configuration stack:
+#   1. Compiled defaults       (lowest)
+#   2. WEND_RAG_* env vars
+#   3. .env file
+#   4. This YAML file          (highest — wins over everything)
+#
+# Any value set here overrides the equivalent environment variable.
+# Omit a key to let the env var or compiled default take effect.
+#
+# See: https://github.com/wend-ai/wendRAG
+
+server:
+  host: "0.0.0.0"
+  port: 3000
+
+storage:
+  # "postgres" or "sqlite"
+  backend: "postgres"
+  # Required when backend is "postgres"
+  database_url: "postgres://user:password@localhost:5432/wendrag"
+  # Used when backend is "sqlite" (default: ./wend-rag.db)
+  # sqlite_path: "./wend-rag.db"
+
+embedding:
+  # "openai", "voyage", or "openai-compatible"
+  provider: "openai-compatible"
+  api_key: ""
+  base_url: "http://localhost:11434/v1/"
+  model: "bge-m3:latest"
+  dimensions: 1024
+
+entity_extraction:
+  enabled: false
+  base_url: "http://localhost:11434"
+  model: "llama3.2"
+  # Falls back to embedding.api_key if omitted
+  # api_key: ""
+
+graph:
+  enabled: false
+  # Clamped to 1–3 by the application
+  traversal_depth: 2
+
+chunking:
+  # "fixed" or "semantic"
+  strategy: "fixed"
+  # Percentile (0.0–1.0) for semantic chunk breaks
+  semantic_threshold: 0.25
+
+# pool:
+#   max_connections: 20
+#   acquire_timeout_secs: 60

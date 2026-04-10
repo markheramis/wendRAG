@@ -26,7 +26,9 @@ pdf-extract = "0.10"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
+serde_yml = "0.0.12"
 glob = "0.3"
 async-trait = "0.1"
 thiserror = "2"

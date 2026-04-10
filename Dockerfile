@@ -23,4 +23,4 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["curl", "-f", "http://localhost:3000/health"]
 
 # curl is available in the rust:bookworm base image.
-CMD ["wend-rag"]
+CMD ["wend-rag", "daemon"]

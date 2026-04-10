@@ -2,7 +2,7 @@
 
 ## Target Environment
 
-This tutorial sets up wendRAG on an **AWS EC2 `c6i.xlarge`** instance running **Ubuntu 24.04 LTS**.
+This tutorial sets up wendRAG on an **AWS EC2 `c6i.xlarge`** instance running **Ubuntu 24.04 LTS**.
 
 **Instance Type**: c6i.xlarge (4 vCPU, 8 GB RAM)
 **Operating System**: Ubuntu 24.04 LTS
@@ -11,9 +11,9 @@ This tutorial sets up wendRAG on an **AWS EC2 `c6i.xlarge`** instance running
 
 When launching your EC2 instance, ensure your security group allows:
 
-- **Port 22** — SSH access from your IP
-- **Port 3000** — wendRAG MCP server (from your application or MCP client)
-- **Port 5432** — PostgreSQL (only if using local PostgreSQL and connecting remotely; skip if RDS handles this separately)
+- **Port 22** — SSH access from your IP
+- **Port 3000** — wendRAG MCP server (from your application or MCP client)
+- **Port 5432** — PostgreSQL (only if using local PostgreSQL and connecting remotely; skip if RDS handles this separately)
 
 SSH into your instance before starting:
 
@@ -83,24 +83,24 @@ sudo apt install -y postgresql postgresql-contrib postgresql-16-pgvector
 sudo systemctl status postgresql   # confirm it's running
 ```
 
-Pre-install the `vector` extension in `template1` so every database created later inherits it automatically — required for migrations to run as a non-superuser:
+Pre-install the `vector` extension in `template1` so every database created later inherits it automatically — required for migrations to run as a non-superuser:
 
 ```bash
 sudo -u postgres psql -d template1 -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ```
 
-Then proceed to **Step 5** and use `localhost:5432` as your host.
+Then proceed to **Step 5** and use `localhost:5432` as your host.
 
 ---
 
 ### Option B — AWS RDS
 
-**Skip installation entirely.** Instead:
+**Skip installation entirely.** Instead:
 
 1. Create an RDS instance in the AWS console with:
     
-    - Engine: **PostgreSQL 16** (pgvector is built in on RDS PostgreSQL 14.5+)
-    - Place it in the **same VPC as your EC2 instance** for private connectivity — no public access needed
+    - Engine: **PostgreSQL 16** (pgvector is built in on RDS PostgreSQL 14.5+)
+    - Place it in the **same VPC as your EC2 instance** for private connectivity — no public access needed
     - Note down: endpoint, port (5432), master username, master password
 2. Connect to your RDS instance from the EC2 instance using the master credentials:
     
@@ -108,7 +108,7 @@ Then proceed to **Step 5** and use `localhost:5432` as your host.
     psql postgres://master_user:master_password@your-rds-endpoint.rds.amazonaws.com:5432/postgres
     ```
     
-3. Enable `vector` in `template1` so test databases inherit it:
+3. Enable `vector` in `template1` so test databases inherit it:
     
     ```sql
     \c template1
@@ -117,7 +117,7 @@ Then proceed to **Step 5** and use `localhost:5432` as your host.
     ```
     
 
-> On RDS, `rds_superuser` is the equivalent of superuser for extension management. Your master user already has it. In Step 5 you will grant it to your app user as well so it can install extensions in the temporary databases the test suite creates.
+> On RDS, `rds_superuser` is the equivalent of superuser for extension management. Your master user already has it. In Step 5 you will grant it to your app user as well so it can install extensions in the temporary databases the test suite creates.
 
 ---
 
@@ -142,7 +142,7 @@ ALTER USER your_username CREATEDB;
 EOF
 ```
 
-**RDS (Option B):** Connect as the master user and run:
+**RDS (Option B):** Connect as the master user and run:
 
 ```sql
 CREATE USER your_username WITH PASSWORD 'your_password';
@@ -152,40 +152,60 @@ ALTER USER your_username CREATEDB;
 GRANT rds_superuser TO your_username;
 ```
 
-> `CREATEDB` is required — the test suite spins up isolated temporary databases per test run.  
-> `rds_superuser` (RDS only) allows the user to install the `vector` extension in those temporary databases.
+> `CREATEDB` is required — the test suite spins up isolated temporary databases per test run.  
+> `rds_superuser` (RDS only) allows the user to install the `vector` extension in those temporary databases.
 
 ---
 
-## Step 6 — Configure the Environment
+## Step 6 — Configure wendRAG
+
+wendRAG supports three configuration layers (lowest to highest priority):
+
+1. **Environment variables** (`WEND_RAG_*`) — baseline
+2. **`.env` file** — convenient for development; overrides env vars
+3. **YAML config file** (`/etc/wend-rag/config.yaml`) — highest priority, ideal for production
+
+For a production Ubuntu server, the recommended approach is the YAML config file.
+
+### Create the config directory and file
 
 ```bash
-cp .env.example .env
-nano .env
+sudo mkdir -p /etc/wend-rag
+sudo cp config.example.yaml /etc/wend-rag/config.yaml
+sudo nano /etc/wend-rag/config.yaml
 ```
 
 Set these values:
 
-```dotenv
-HOST=0.0.0.0
-PORT=3000
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 3000
 
-STORAGE_BACKEND=postgres
+storage:
+  backend: "postgres"
+  # Local:
+  database_url: "postgres://your_username:your_password@localhost:5432/your_database"
+  # RDS:
+  # database_url: "postgres://your_username:your_password@your-rds-endpoint.rds.amazonaws.com:5432/your_database"
 
-# Local:
-DATABASE_URL=postgres://your_username:your_password@localhost:5432/your_database
-
-# RDS:
-# DATABASE_URL=postgres://your_username:your_password@your-rds-endpoint.rds.amazonaws.com:5432/your_database
-
-EMBEDDING_PROVIDER=openai-compatible
-EMBEDDING_API_KEY=ollama
-EMBEDDING_MODEL=bge-m3:latest
-EMBEDDING_BASE_URL=http://localhost:11434/v1/
-EMBEDDING_DIMENSIONS=1024
+embedding:
+  provider: "openai-compatible"
+  api_key: "ollama"
+  model: "bge-m3:latest"
+  base_url: "http://localhost:11434/v1/"
+  dimensions: 1024
 ```
 
-Leave everything else commented out for a basic setup.
+Set restrictive file permissions:
+
+```bash
+sudo chmod 640 /etc/wend-rag/config.yaml
+```
+
+> **Note:** You can still use a `.env` file or `WEND_RAG_*` environment variables. Any value set in the YAML config file takes priority over both.
+
+> **All environment variables use the `WEND_RAG_` prefix.** For example: `WEND_RAG_HOST`, `WEND_RAG_PORT`, `WEND_RAG_DATABASE_URL`, `WEND_RAG_EMBEDDING_PROVIDER`, etc.
 
 ---
 
@@ -195,13 +215,13 @@ Leave everything else commented out for a basic setup.
 cargo build --release
 ```
 
-The first build downloads and compiles all dependencies — this takes a few minutes. On a `c6i.xlarge` with 4 vCPUs, Cargo will parallelize the compilation automatically.
+The first build downloads and compiles all dependencies — this takes a few minutes. On a `c6i.xlarge` with 4 vCPUs, Cargo will parallelize the compilation automatically.
 
 ---
 
 ## Step 8 — Install the Binary System-Wide
 
-Copy the compiled binary to `/usr/local/bin` so `wendRAG` is available from anywhere on the server:
+Copy the compiled binary to `/usr/local/bin` so `wendRAG` is available from anywhere on the server:
 
 ```bash
 sudo cp target/release/wend-rag /usr/local/bin/wendRAG
@@ -211,6 +231,25 @@ Verify it works:
 
 ```bash
 wendRAG --help
+```
+
+You should see the CLI help output:
+
+```
+wendRAG — RAG-powered MCP server
+
+Usage: wend-rag [OPTIONS] <COMMAND>
+
+Commands:
+  daemon   Start the RAG + MCP service over HTTP
+  ingest   One-shot document ingestion, then exit
+  stdio    Start the MCP server over stdio transport
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -c, --config <CONFIG>  Path to YAML config file
+  -h, --help             Print help
+  -V, --version          Print version
 ```
 
 ---
@@ -233,9 +272,7 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/wendRAG
-EnvironmentFile=/home/ubuntu/wendRAG/.env
-ExecStart=/usr/local/bin/wendRAG
+ExecStart=/usr/local/bin/wendRAG daemon
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -244,13 +281,15 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-> If you are using **local PostgreSQL** (Option A), add `postgresql.service` to the `After=` line:
+> If you are using **local PostgreSQL** (Option A), add `postgresql.service` to the `After=` line:
 > 
 > ```ini
 > After=network.target postgresql.service
 > ```
 
 The server handles SIGTERM gracefully — when systemd sends the stop signal, in-flight HTTP requests are allowed to complete before the process exits. `TimeoutStopSec=30` gives the server up to 30 seconds to drain; after that systemd sends SIGKILL.
+
+The systemd unit does not need an `EnvironmentFile=` directive — wendRAG reads its configuration from `/etc/wend-rag/config.yaml` automatically on Linux.
 
 Enable and start the service:
 
@@ -283,16 +322,16 @@ Clone your knowledge base repository and ingest it:
 ```bash
 cd ~/
 git clone {your-knowledge-base-repository}
-wendRAG --ingest ~/{your-knowledge-base-repository}
+wendRAG ingest ~/{your-knowledge-base-repository}
 ```
 
-wendRAG will recursively scan the directory for `.md`, `.txt`, and `.pdf` files, chunk and embed them, and load everything into the database. It prints a JSON summary when done and exits — the running service is unaffected.
+wendRAG will recursively scan the directory for `.md`, `.txt`, and `.pdf` files, chunk and embed them, and load everything into the database. It prints a JSON summary when done and exits — the running service is unaffected.
 
 To re-ingest after pulling updates:
 
 ```bash
 cd ~/{your-knowledge-base-repository} && git pull
-wendRAG --ingest ~/{your-knowledge-base-repository}
+wendRAG ingest ~/{your-knowledge-base-repository}
 ```
 
 Files whose content has not changed are automatically skipped (hash-based deduplication), so re-ingestion only processes what actually changed.
@@ -324,7 +363,7 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured
 
 ## Step 12 — Connect an MCP Client
 
-The server exposes MCP over HTTP at `http://your-ec2-public-ip:3000/mcp`. Add to your MCP client config:
+The server exposes MCP over HTTP at `http://your-ec2-public-ip:3000/mcp`. Add to your MCP client config:
 
 ```json
 {
@@ -342,10 +381,10 @@ The server exposes MCP over HTTP at `http://your-ec2-public-ip:3000/mcp`. Add t
 Or use stdio mode (for clients that launch the process directly):
 
 ```bash
-./target/release/wend-rag --stdio
+wend-rag stdio
 ```
 
-The `mcp.json` in the repo root has ready-made entries for both transports.
+The `mcp.json` in the repo root has ready-made entries for both transports.
 
 ---
 
@@ -357,14 +396,17 @@ Pull a local LLM via Ollama:
 ollama pull llama3.2
 ```
 
-Add to `.env`:
+Add to `/etc/wend-rag/config.yaml`:
 
-```dotenv
-ENTITY_EXTRACTION_ENABLED=true
-GRAPH_RETRIEVAL_ENABLED=true
-GRAPH_TRAVERSAL_DEPTH=2
-ENTITY_EXTRACTION_LLM_URL=http://localhost:11434
-ENTITY_EXTRACTION_LLM_MODEL=llama3.2
+```yaml
+entity_extraction:
+  enabled: true
+  base_url: "http://localhost:11434"
+  model: "llama3.2"
+
+graph:
+  enabled: true
+  traversal_depth: 2
 ```
 
 Restart the service:
@@ -377,15 +419,47 @@ Ingested documents will now have entities and relationships extracted and stored
 
 ---
 
+## Environment Variable Reference
+
+All environment variables use the `WEND_RAG_` prefix. The YAML config file takes priority over these.
+
+| Variable | Description | Default |
+|---|---|---|
+| `WEND_RAG_HOST` | Bind address | `0.0.0.0` |
+| `WEND_RAG_PORT` | HTTP port | `3000` |
+| `WEND_RAG_STORAGE_BACKEND` | `postgres` or `sqlite` | `sqlite` |
+| `WEND_RAG_DATABASE_URL` | PostgreSQL connection URL | *(none)* |
+| `WEND_RAG_SQLITE_PATH` | SQLite file path | `./wend-rag.db` |
+| `WEND_RAG_EMBEDDING_PROVIDER` | `openai`, `voyage`, or `openai-compatible` | `openai` |
+| `WEND_RAG_EMBEDDING_API_KEY` | API key for embedding service | *(empty)* |
+| `WEND_RAG_EMBEDDING_BASE_URL` | Embedding API base URL | *(provider default)* |
+| `WEND_RAG_EMBEDDING_MODEL` | Embedding model name | *(provider default)* |
+| `WEND_RAG_EMBEDDING_DIMENSIONS` | Vector dimensions | *(provider default)* |
+| `WEND_RAG_ENTITY_EXTRACTION_ENABLED` | Enable entity extraction | `false` |
+| `WEND_RAG_ENTITY_EXTRACTION_LLM_URL` | LLM URL for extraction | *(falls back to embedding URL)* |
+| `WEND_RAG_ENTITY_EXTRACTION_LLM_MODEL` | LLM model for extraction | `gpt-4.1-mini` |
+| `WEND_RAG_ENTITY_EXTRACTION_API_KEY` | API key for extraction | *(falls back to embedding key)* |
+| `WEND_RAG_GRAPH_RETRIEVAL_ENABLED` | Enable graph retrieval | `false` |
+| `WEND_RAG_GRAPH_TRAVERSAL_DEPTH` | Graph traversal depth (1–3) | `2` |
+| `WEND_RAG_CHUNKING_STRATEGY` | `fixed` or `semantic` | `fixed` |
+| `WEND_RAG_CHUNKING_SEMANTIC_THRESHOLD` | Semantic breakpoint percentile | `0.25` |
+| `WEND_RAG_POOL_MAX_CONNECTIONS` | DB connection pool size | `20` |
+| `WEND_RAG_POOL_ACQUIRE_TIMEOUT_SECS` | Pool acquire timeout (seconds) | `60` |
+| `WEND_RAG_CONFIG` | Override config file path | `/etc/wend-rag/config.yaml` |
+
+---
+
 ## Troubleshooting
 
 |Error|Fix|
 |---|---|
-|`permission denied to create database`|`ALTER USER your_username CREATEDB;` as postgres/master superuser|
-|`permission denied to create extension "vector"`|Local: run the `template1` command in Step 4A. RDS: `GRANT rds_superuser TO your_username;`|
-|`connection refused` on port 5432|Local: `sudo systemctl start postgresql`. RDS: check the RDS security group allows port 5432 from the EC2 instance's security group|
-|`connection refused` on port 3000|Check the EC2 security group allows inbound traffic on port 3000|
+|`permission denied to create database`|`ALTER USER your_username CREATEDB;` as postgres/master superuser|
+|`permission denied to create extension "vector"`|Local: run the `template1` command in Step 4A. RDS: `GRANT rds_superuser TO your_username;`|
+|`connection refused` on port 5432|Local: `sudo systemctl start postgresql`. RDS: check the RDS security group allows port 5432 from the EC2 instance's security group|
+|`connection refused` on port 3000|Check the EC2 security group allows inbound traffic on port 3000|
 |`bge-m3 model not found`|`ollama pull bge-m3`|
-|Build fails on `aws-lc-sys` / `ring`|`sudo apt install cmake libclang-dev`|
-|Service fails to start|Check logs with `journalctl -u wendrag -f` and verify the `.env` path in the unit file|
-|`wendRAG: command not found`|Re-run `sudo cp target/release/wend-rag /usr/local/bin/wendRAG`|
+|Build fails on `aws-lc-sys` / `ring`|`sudo apt install cmake libclang-dev`|
+|Service fails to start|Check logs with `journalctl -u wendrag -f` and verify `/etc/wend-rag/config.yaml`|
+|`wendRAG: command not found`|Re-run `sudo cp target/release/wend-rag /usr/local/bin/wendRAG`|
+|Config file not loading|Verify the file exists at `/etc/wend-rag/config.yaml` and is valid YAML. Use `-c /path/to/config.yaml` to specify explicitly.|
+|Old env vars not working|All env vars now require the `WEND_RAG_` prefix (e.g. `HOST` → `WEND_RAG_HOST`)|

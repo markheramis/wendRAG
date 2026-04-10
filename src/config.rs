@@ -1,6 +1,7 @@
 use std::env;
 use std::time::Duration;
 
+use crate::config_file::FileConfig;
 use crate::entity::{DEFAULT_GRAPH_TRAVERSAL_DEPTH, GraphSettings};
 
 const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 20;
@@ -17,12 +18,6 @@ pub enum EmbeddingProviderKind {
 pub enum StorageBackendKind {
     Postgres,
     Sqlite,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportMode {
-    Http,
-    Stdio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +41,6 @@ impl ChunkingStrategy {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub transport: TransportMode,
     pub host: String,
     pub port: u16,
     pub storage_backend: StorageBackendKind,
@@ -73,8 +67,9 @@ pub struct Config {
 
 /**
  * Connection pool tuning knobs shared by both the PostgreSQL and SQLite
- * backends. Parsed from `POOL_MAX_CONNECTIONS` and `POOL_ACQUIRE_TIMEOUT_SECS`
- * environment variables with safe production defaults.
+ * backends. Parsed from `WEND_RAG_POOL_MAX_CONNECTIONS` and
+ * `WEND_RAG_POOL_ACQUIRE_TIMEOUT_SECS` environment variables with safe
+ * production defaults.
  */
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
@@ -101,26 +96,38 @@ pub enum ConfigError {
     InvalidProvider(String),
     #[error("unknown storage backend: {0} (expected postgres or sqlite)")]
     InvalidStorageBackend(String),
-    #[error("DATABASE_URL is required when STORAGE_BACKEND=postgres")]
+    #[error("WEND_RAG_DATABASE_URL is required when storage backend is postgres")]
     MissingDatabaseUrlForPostgres,
 }
 
-impl Config {
-    /**
-     * Determines the transport mode from CLI args and environment.
-     * Priority: `--stdio` CLI flag > `MCP_TRANSPORT` env var > default (Http).
-     */
-    fn resolve_transport(args: &[String], transport_env: Option<&str>) -> TransportMode {
-        if args.iter().any(|arg| arg == "--stdio") {
-            return TransportMode::Stdio;
-        }
-
-        match transport_env {
-            Some("stdio") => TransportMode::Stdio,
-            _ => TransportMode::Http,
-        }
+/**
+ * Returns the YAML file value if present, otherwise falls back to the
+ * environment variable. Returns `None` when neither source provides a value.
+ *
+ * Precedence: YAML (highest) > env var (lowest of the two).
+ */
+fn yaml_or_env(env_name: &str, yaml_value: Option<String>) -> Option<String> {
+    if yaml_value.is_some() {
+        return yaml_value;
     }
+    env::var(env_name).ok()
+}
 
+/**
+ * Parses a relaxed boolean from an optional string, accepting common truthy
+ * values (`1`, `true`, `yes`, `on`) while treating everything else as false.
+ */
+fn parse_loose_bool(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => default,
+    }
+}
+
+impl Config {
     /**
      * Resolves the active storage backend from explicit configuration first,
      * then falls back to the presence of a PostgreSQL URL.
@@ -139,45 +146,26 @@ impl Config {
     }
 
     /**
-     * Parses a relaxed boolean environment variable, accepting common truthy
-     * values while treating everything else as false.
+     * Loads runtime configuration by merging layers in order of increasing
+     * priority:
+     *
+     *   1. Compiled defaults (lowest)
+     *   2. `WEND_RAG_*` environment variables
+     *   3. `.env` file (loaded into the process environment by dotenvy)
+     *   4. YAML config file values (highest)
+     *
+     * The `.env` file is loaded into the process env via `dotenvy::dotenv()`
+     * before any `env::var` call, so layers 2 and 3 are read together from
+     * `env::var`. The YAML layer (`file_config`) then overrides on top.
      */
-    fn parse_env_bool(name: &str, default: bool) -> bool {
-        env::var(name)
-            .ok()
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(default)
-    }
-
-    /**
-     * Parses the graph traversal depth and clamps it into the supported range
-     * used by the PostgreSQL recursive CTE implementation.
-     */
-    fn parse_graph_settings() -> GraphSettings {
-        let enabled = Self::parse_env_bool("GRAPH_RETRIEVAL_ENABLED", false);
-        let traversal_depth = env::var("GRAPH_TRAVERSAL_DEPTH")
-            .ok()
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(DEFAULT_GRAPH_TRAVERSAL_DEPTH);
-        GraphSettings::new(enabled, traversal_depth)
-    }
-
-    /**
-     * Loads runtime configuration from environment variables after optionally
-     * reading a local `.env` file.
-     */
-    pub fn from_env() -> Result<Self, ConfigError> {
+    pub fn load(file_config: Option<&FileConfig>) -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
 
-        let args: Vec<String> = env::args().collect();
-        let transport = Self::resolve_transport(&args, env::var("MCP_TRANSPORT").ok().as_deref());
+        let empty = FileConfig::default();
+        let fc = file_config.unwrap_or(&empty);
 
-        let provider_str = env::var("EMBEDDING_PROVIDER").unwrap_or_else(|_| "openai".into());
+        let provider_str = yaml_or_env("WEND_RAG_EMBEDDING_PROVIDER", fc.embedding.provider.clone())
+            .unwrap_or_else(|| "openai".into());
         let provider = match provider_str.as_str() {
             "openai" => EmbeddingProviderKind::OpenAi,
             "voyage" => EmbeddingProviderKind::Voyage,
@@ -193,60 +181,147 @@ impl Config {
             EmbeddingProviderKind::OpenAiCompatible => ("http://localhost:1234", "default", 1536),
         };
 
-        let database_url = env::var("DATABASE_URL").ok();
+        let database_url =
+            yaml_or_env("WEND_RAG_DATABASE_URL", fc.storage.database_url.clone());
+        let storage_backend_str =
+            yaml_or_env("WEND_RAG_STORAGE_BACKEND", fc.storage.backend.clone());
         let storage_backend = Self::resolve_storage_backend(
-            env::var("STORAGE_BACKEND").ok().as_deref(),
+            storage_backend_str.as_deref(),
             database_url.is_some(),
         )?;
-        let graph_settings = Self::parse_graph_settings();
 
         if storage_backend == StorageBackendKind::Postgres && database_url.is_none() {
             return Err(ConfigError::MissingDatabaseUrlForPostgres);
         }
 
-        let chunking_strategy = env::var("CHUNKING_STRATEGY")
+        let graph_enabled_str =
+            yaml_or_env("WEND_RAG_GRAPH_RETRIEVAL_ENABLED", fc.graph.enabled.map(|b| b.to_string()));
+        let graph_enabled = parse_loose_bool(graph_enabled_str.as_deref(), false);
+
+        let graph_depth = fc
+            .graph
+            .traversal_depth
+            .or_else(|| {
+                env::var("WEND_RAG_GRAPH_TRAVERSAL_DEPTH")
+                    .ok()
+                    .and_then(|v| v.parse::<u8>().ok())
+            })
+            .unwrap_or(DEFAULT_GRAPH_TRAVERSAL_DEPTH);
+        let graph_settings = GraphSettings::new(graph_enabled, graph_depth);
+
+        let chunking_strategy_str =
+            yaml_or_env("WEND_RAG_CHUNKING_STRATEGY", fc.chunking.strategy.clone());
+        let chunking_strategy = chunking_strategy_str
             .map(|s| ChunkingStrategy::from_str_loose(&s))
             .unwrap_or(ChunkingStrategy::Fixed);
 
-        let chunking_semantic_threshold = env::var("CHUNKING_SEMANTIC_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let chunking_semantic_threshold = fc
+            .chunking
+            .semantic_threshold
+            .or_else(|| {
+                env::var("WEND_RAG_CHUNKING_SEMANTIC_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(0.25);
 
-        let pool_max_connections = env::var("POOL_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let host = yaml_or_env("WEND_RAG_HOST", fc.server.host.clone())
+            .unwrap_or_else(|| "0.0.0.0".into());
+
+        let port_str = yaml_or_env(
+            "WEND_RAG_PORT",
+            fc.server.port.map(|p| p.to_string()),
+        )
+        .unwrap_or_else(|| "3000".into());
+        let port: u16 = port_str.parse()?;
+
+        let sqlite_path = yaml_or_env("WEND_RAG_SQLITE_PATH", fc.storage.sqlite_path.clone())
+            .unwrap_or_else(|| "./wend-rag.db".into());
+
+        let embedding_api_key =
+            yaml_or_env("WEND_RAG_EMBEDDING_API_KEY", fc.embedding.api_key.clone())
+                .unwrap_or_default();
+
+        let embedding_base_url =
+            yaml_or_env("WEND_RAG_EMBEDDING_BASE_URL", fc.embedding.base_url.clone())
+                .unwrap_or_else(|| default_base_url.into());
+
+        let embedding_model =
+            yaml_or_env("WEND_RAG_EMBEDDING_MODEL", fc.embedding.model.clone())
+                .unwrap_or_else(|| default_model.into());
+
+        let embedding_dimensions = fc
+            .embedding
+            .dimensions
+            .or_else(|| {
+                env::var("WEND_RAG_EMBEDDING_DIMENSIONS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(default_dims);
+
+        let entity_extraction_enabled_str = yaml_or_env(
+            "WEND_RAG_ENTITY_EXTRACTION_ENABLED",
+            fc.entity_extraction.enabled.map(|b| b.to_string()),
+        );
+        let entity_extraction_enabled =
+            parse_loose_bool(entity_extraction_enabled_str.as_deref(), false);
+
+        let entity_extraction_base_url = yaml_or_env(
+            "WEND_RAG_ENTITY_EXTRACTION_LLM_URL",
+            fc.entity_extraction.base_url.clone(),
+        )
+        .or_else(|| yaml_or_env("WEND_RAG_EMBEDDING_BASE_URL", fc.embedding.base_url.clone()))
+        .unwrap_or_else(|| default_base_url.into());
+
+        let entity_extraction_model = yaml_or_env(
+            "WEND_RAG_ENTITY_EXTRACTION_LLM_MODEL",
+            fc.entity_extraction.model.clone(),
+        )
+        .unwrap_or_else(|| "gpt-4.1-mini".into());
+
+        let entity_extraction_api_key = yaml_or_env(
+            "WEND_RAG_ENTITY_EXTRACTION_API_KEY",
+            fc.entity_extraction.api_key.clone(),
+        )
+        .or_else(|| yaml_or_env("WEND_RAG_EMBEDDING_API_KEY", fc.embedding.api_key.clone()))
+        .unwrap_or_default();
+
+        let pool_max_connections = fc
+            .pool
+            .max_connections
+            .or_else(|| {
+                env::var("WEND_RAG_POOL_MAX_CONNECTIONS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(DEFAULT_POOL_MAX_CONNECTIONS);
-        let pool_acquire_timeout_secs = env::var("POOL_ACQUIRE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+
+        let pool_acquire_timeout_secs = fc
+            .pool
+            .acquire_timeout_secs
+            .or_else(|| {
+                env::var("WEND_RAG_POOL_ACQUIRE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS);
 
         Ok(Config {
-            transport,
-            host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
-            port: env::var("PORT").unwrap_or_else(|_| "3000".into()).parse()?,
+            host,
+            port,
             storage_backend,
             database_url,
-            sqlite_path: env::var("SQLITE_PATH").unwrap_or_else(|_| "./wend-rag.db".into()),
+            sqlite_path,
             embedding_provider: provider,
-            embedding_api_key: env::var("EMBEDDING_API_KEY").unwrap_or_default(),
-            embedding_base_url: env::var("EMBEDDING_BASE_URL")
-                .unwrap_or_else(|_| default_base_url.into()),
-            embedding_model: env::var("EMBEDDING_MODEL").unwrap_or_else(|_| default_model.into()),
-            embedding_dimensions: env::var("EMBEDDING_DIMENSIONS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default_dims),
-            entity_extraction_enabled: Self::parse_env_bool("ENTITY_EXTRACTION_ENABLED", false),
-            entity_extraction_base_url: env::var("ENTITY_EXTRACTION_LLM_URL")
-                .or_else(|_| env::var("EMBEDDING_BASE_URL"))
-                .unwrap_or_else(|_| default_base_url.into()),
-            entity_extraction_model: env::var("ENTITY_EXTRACTION_LLM_MODEL")
-                .unwrap_or_else(|_| "gpt-4.1-mini".into()),
-            entity_extraction_api_key: env::var("ENTITY_EXTRACTION_API_KEY")
-                .or_else(|_| env::var("EMBEDDING_API_KEY"))
-                .unwrap_or_default(),
+            embedding_api_key,
+            embedding_base_url,
+            embedding_model,
+            embedding_dimensions,
+            entity_extraction_enabled,
+            entity_extraction_base_url,
+            entity_extraction_model,
+            entity_extraction_api_key,
             graph_settings,
             chunking_strategy,
             chunking_semantic_threshold,
@@ -260,7 +335,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, StorageBackendKind, TransportMode};
+    use super::{Config, ConfigError, StorageBackendKind};
+    use crate::config_file::FileConfig;
     use crate::entity::GraphSettings;
 
     /**
@@ -305,16 +381,6 @@ mod tests {
     }
 
     /**
-     * Verifies that the stdio transport flag overrides the environment value.
-     */
-    #[test]
-    fn stdio_flag_overrides_transport_env() {
-        let transport =
-            Config::resolve_transport(&["wend-rag".into(), "--stdio".into()], Some("http"));
-        assert_eq!(transport, TransportMode::Stdio);
-    }
-
-    /**
      * Verifies that graph settings clamp their traversal depth into the
      * supported range while preserving the explicit enable flag.
      */
@@ -323,5 +389,47 @@ mod tests {
         let settings = GraphSettings::new(true, 9);
         assert!(settings.enabled);
         assert_eq!(settings.traversal_depth, 3);
+    }
+
+    /**
+     * Verifies that YAML values take priority over environment variables.
+     * Uses a FileConfig with an explicit port, while the env would default
+     * to 3000.
+     */
+    #[test]
+    fn yaml_overrides_env_values() {
+        let yaml = r#"
+server:
+  port: 9999
+storage:
+  backend: "sqlite"
+  sqlite_path: "/tmp/test.db"
+embedding:
+  provider: "openai"
+"#;
+        let fc: FileConfig = serde_yml::from_str(yaml).unwrap();
+        let cfg = Config::load(Some(&fc)).unwrap();
+
+        assert_eq!(cfg.port, 9999);
+        assert_eq!(cfg.sqlite_path, "/tmp/test.db");
+    }
+
+    /**
+     * Verifies that a YAML-only config (no env vars) produces a config that
+     * reflects the YAML values with compiled defaults filling the gaps.
+     */
+    #[test]
+    fn loads_from_yaml_with_compiled_defaults() {
+        let yaml = r#"
+storage:
+  backend: "sqlite"
+embedding:
+  provider: "openai"
+"#;
+        let fc: FileConfig = serde_yml::from_str(yaml).unwrap();
+        let cfg = Config::load(Some(&fc)).unwrap();
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 3000);
+        assert_eq!(cfg.storage_backend, StorageBackendKind::Sqlite);
     }
 }
