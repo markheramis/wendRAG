@@ -56,7 +56,10 @@ impl EmbeddingProvider for OpenAiCompatProvider {
             let batch_end = (batch_start + self.batch_size).min(texts.len());
             let batch = &texts[batch_start..batch_end];
 
-            let url = format!("{}/v1/embeddings", self.base_url.trim_end_matches('/'));
+
+            let base = self.base_url.trim_end_matches('/');
+            let base = base.trim_end_matches("/v1");
+            let url = format!("{base}/v1/embeddings");
             let body = EmbeddingRequest {
                 input: batch,
                 model: &self.model,
