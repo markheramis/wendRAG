@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "code-rag": {
+      "command": "./target/release/code-rag",
+      "args": ["--stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://coderag:coderag@localhost:5432/coderag",
+        "EMBEDDING_PROVIDER": "openai",
+        "EMBEDDING_API_KEY": "sk-your-key-here",
+        "EMBEDDING_MODEL": "text-embedding-3-small"
+      }
+    },
+    "code-rag-http": {
+      "url": "http://localhost:3000/mcp"
+    }
+  }
+}

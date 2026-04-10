@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: coderag
+      POSTGRES_PASSWORD: coderag
+      POSTGRES_DB: coderag
+    # Host port must avoid Windows excluded ranges (often ~5083–5882 with Hyper-V/WSL).
+    ports:
+      - "15432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coderag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  wend-rag:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Overrides host .env so the container talks to compose Postgres, not localhost.
+      STORAGE_BACKEND: postgres
+      DATABASE_URL: postgres://coderag:coderag@postgres:5432/coderag
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - D:/dentalray-knowledge-base:/data/docs:ro
+
+volumes:
+  pgdata:
