@@ -3592,6 +3592,7 @@ dependencies = [
  "dotenvy",
  "glob",
  "html-to-markdown-rs",
+ "libc",
  "pdf-extract",
  "pgvector",
  "pulldown-cmark",

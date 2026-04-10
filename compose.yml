@@ -33,6 +33,12 @@ services:
       - "3000:3000"
     volumes:
       - D:/dentalray-knowledge-base:/data/docs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 
 volumes:
   pgdata:

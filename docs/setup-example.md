@@ -238,6 +238,7 @@ EnvironmentFile=/home/ubuntu/wendRAG/.env
 ExecStart=/usr/local/bin/wendRAG
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -249,6 +250,8 @@ WantedBy=multi-user.target
 > After=network.target postgresql.service
 > ```
 
+The server handles SIGTERM gracefully — when systemd sends the stop signal, in-flight HTTP requests are allowed to complete before the process exits. `TimeoutStopSec=30` gives the server up to 30 seconds to drain; after that systemd sends SIGKILL.
+
 Enable and start the service:
 
 ```bash
@@ -256,6 +259,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable wendrag
 sudo systemctl start wendrag
 sudo systemctl status wendrag
+```
+
+Verify the health endpoint:
+
+```bash
+curl http://localhost:3000/health
+# Expected: {"status":"ok"}
 ```
 
 Check logs at any time:

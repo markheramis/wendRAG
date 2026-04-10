@@ -1,8 +1,8 @@
 FROM rust:1.92-bookworm
 
-# Base OS certs for HTTPS clients inside the container.
+# Base OS certs for HTTPS clients; curl for the HEALTHCHECK probe.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -19,4 +19,8 @@ RUN cargo build --release \
 
 EXPOSE 3000
 
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["curl", "-f", "http://localhost:3000/health"]
+
+# curl is available in the rust:bookworm base image.
 CMD ["wend-rag"]

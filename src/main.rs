@@ -2,6 +2,7 @@ use std::env;
 use std::io::{self, ErrorKind};
 use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use wend_rag::config::{Config, EmbeddingProviderKind, StorageBackendKind, TransportMode};
 use wend_rag::embed::{self, OpenAiCompatProvider};
 use wend_rag::entity::{EntityExtractor, OpenAiCompatEntityExtractor};
@@ -170,7 +171,9 @@ async fn run_cli_ingest(
 
 /**
  * Starts the MCP server over Streamable HTTP transport (default).
- * Binds an Axum router on `host:port` with the MCP endpoint at `/mcp`.
+ * Binds an Axum router on `host:port` with the MCP endpoint at `/mcp` and a
+ * plain `/health` endpoint for systemd, load-balancers, and container probes.
+ * Listens for SIGTERM / ctrl_c and drains in-flight requests before exiting.
  */
 async fn serve_http(
     server: WendRagServer,
@@ -187,11 +190,49 @@ async fn serve_http(
             StreamableHttpServerConfig::default(),
         );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .route("/health", axum::routing::get(health_handler))
+        .nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    tracing::info!("server shut down gracefully");
     Ok(())
+}
+
+/**
+ * Returns a 200 OK JSON response for health probes. Intentionally lightweight
+ * — it confirms the HTTP listener is alive without touching the database.
+ */
+async fn health_handler() -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "status": "ok" }))
+}
+
+/**
+ * Waits for either ctrl_c (SIGINT) or SIGTERM, whichever arrives first, so
+ * `axum::serve` can begin its graceful shutdown sequence.
+ */
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        tracing::info!("received SIGINT, shutting down");
+    }
 }
 
 /**
