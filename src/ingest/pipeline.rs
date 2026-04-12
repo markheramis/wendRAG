@@ -92,7 +92,7 @@ pub async fn ingest_file(
     max_sentences: usize,
     filter_garbage: bool,
 ) -> Result<IngestResult, IngestError> {
-    let source = read_source(file_path).await?;
+    let source = read_source(file_path, None).await?;
     let options = IngestOptions::new(
         project,
         tags,

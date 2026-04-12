@@ -18,6 +18,7 @@
 pub mod buffer;
 pub mod manager;
 pub mod retrieval;
+pub mod storage;
 pub mod types;
 
 pub use buffer::{SessionBuffer, SessionConfig};

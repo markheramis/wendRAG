@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::config_file::FileConfig;
 use crate::entity::{DEFAULT_GRAPH_TRAVERSAL_DEPTH, GraphSettings};
+use crate::memory::MemoryConfig;
 use crate::rerank::{DEFAULT_RERANKER_TOP_N, RerankerConfig, RerankerProviderKind};
 
 const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 20;

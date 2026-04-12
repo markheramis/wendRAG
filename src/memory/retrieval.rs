@@ -10,7 +10,7 @@
  */
 
 use crate::memory::{
-    buffer::{SessionBuffer, SessionContext},
+    buffer::SessionBuffer,
     storage::{MemoryStorage, MemoryStorageError},
     types::{MemoryEntry, MemoryQuery, MemoryScope, ChatMessage, MessageRole},
     calculate_recency_weighted_score,

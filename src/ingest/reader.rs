@@ -1,11 +1,84 @@
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use url::Url;
 
 use super::url::read_url_document;
 
 pub const URL_FILE_TYPE: &str = "url";
+
+/**
+ * Validates that a file path is safe to read (prevents directory traversal).
+ *
+ * Ensures the resolved absolute path:
+ * - Does not escape the base directory via parent directory references (../)
+ * - Is within the intended filesystem boundaries
+ *
+ * Parameters:
+ * - `path`: The user-provided path to validate.
+ * - `base_dir`: Optional base directory that the path must stay within.
+ *              If None, the current working directory is used.
+ *
+ * Returns:
+ * - `Ok(PathBuf)` containing the canonicalized path if valid.
+ * - `Err(ReadError)` if the path is invalid or escapes the base directory.
+ */
+pub fn validate_safe_path(path: &str, base_dir: Option<&Path>) -> Result<PathBuf, ReadError> {
+    // Reject paths with null bytes
+    if path.contains('\0') {
+        return Err(ReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Path contains null bytes",
+        )));
+    }
+
+    // Parse the path
+    let path = Path::new(path);
+
+    // Get the base directory
+    let base = match base_dir {
+        Some(b) => b.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| ReadError::Io(e))?,
+    };
+
+    // Resolve to absolute path
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+
+    // Canonicalize the path (resolves symlinks and ../)
+    let canonical_base = base.canonicalize().map_err(|e| ReadError::Io(e))?;
+    let canonical_path = match absolute_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // Path doesn't exist yet - check if the parent is valid
+            // This allows creating new files in valid directories
+            if let Some(parent) = absolute_path.parent() {
+                let canonical_parent = parent.canonicalize().map_err(|e| ReadError::Io(e))?;
+                if !canonical_parent.starts_with(&canonical_base) {
+                    return Err(ReadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Path escapes base directory",
+                    )));
+                }
+            }
+            // Return the non-canonical path - caller will handle file creation
+            absolute_path
+        }
+    };
+
+    // Ensure the path is within the base directory
+    if canonical_path.exists() && !canonical_path.starts_with(&canonical_base) {
+        return Err(ReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Path escapes base directory",
+        )));
+    }
+
+    Ok(canonical_path)
+}
 
 #[derive(Debug, Clone)]
 pub struct ReadDocument {
@@ -41,6 +114,8 @@ pub enum ReadError {
     HtmlConversion(String),
     #[error("unsupported file type: {0}")]
     UnsupportedType(String),
+    #[error("path validation failed: {0}")]
+    InvalidPath(String),
 }
 
 /**
@@ -77,13 +152,21 @@ pub fn detect_file_type(path: &str) -> Option<&'static str> {
  * Reads a supported ingest source and normalizes it into a shared document
  * shape for the downstream chunking and embedding pipeline.
  *
+ * SECURITY NOTE: For local files, this function validates the path to prevent
+ * directory traversal attacks. The path must stay within the current working
+ * directory or a specified base directory.
+ *
  * Parameters:
  * - `path`: Local filesystem path or absolute HTTP(S) URL.
+ * - `base_dir`: Optional base directory for path validation (defaults to current dir).
  *
  * Returns:
  * - `ReadDocument` containing the normalized file name, file type, and text.
  */
-pub async fn read_source(path: &str) -> Result<ReadDocument, ReadError> {
+pub async fn read_source(
+    path: &str,
+    base_dir: Option<&Path>,
+) -> Result<ReadDocument, ReadError> {
     let file_type =
         detect_file_type(path).ok_or_else(|| ReadError::UnsupportedType(path.to_string()))?;
 
@@ -91,36 +174,44 @@ pub async fn read_source(path: &str) -> Result<ReadDocument, ReadError> {
         return read_url_document(path).await;
     }
 
-    let file_name = Path::new(path)
+    // SECURITY: Validate path to prevent directory traversal
+    let validated_path = validate_safe_path(path, base_dir)?;
+
+    let file_name = validated_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(path)
         .to_string();
+
+    let path_str = validated_path.to_str().ok_or_else(|| {
+        ReadError::InvalidPath("Path contains invalid Unicode characters".to_string())
+    })?;
+
     match file_type {
         "markdown" | "text" => Ok(ReadDocument {
             file_name,
             file_type,
-            text: std::fs::read_to_string(path)?,
+            text: std::fs::read_to_string(&validated_path)?,
         }),
         "pdf" => Ok(ReadDocument {
             file_name,
             file_type,
-            text: read_pdf(path)?,
+            text: read_pdf(path_str)?,
         }),
         "docx" => Ok(ReadDocument {
             file_name,
             file_type,
-            text: read_docx(path)?,
+            text: read_docx(path_str)?,
         }),
         "csv" => Ok(ReadDocument {
             file_name,
             file_type,
-            text: read_csv(path)?,
+            text: read_csv(path_str)?,
         }),
         "json" => Ok(ReadDocument {
             file_name,
             file_type,
-            text: read_json(path)?,
+            text: read_json(path_str)?,
         }),
         _ => Err(ReadError::UnsupportedType(file_type.to_string())),
     }

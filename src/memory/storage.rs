@@ -364,9 +364,7 @@ impl MemoryStorage for PostgresMemoryStorage {
             query.scope.is_some() as usize + query.session_id.is_some() as usize + 
             query.user_id.is_some() as usize + 1));
 
-        let mut query_builder = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>, 
-            String, f32, chrono::NaiveDateTime, chrono::NaiveDateTime, i32, String, String, 
-            Option<i64>, Option<Uuid>, serde_json::Value, Option<Vec<f32>>)>(&sql);
+        let mut query_builder = sqlx::query(&sql);
 
         if let Some(scope) = &query.scope {
             query_builder = query_builder.bind(scope.as_str());
@@ -501,11 +499,8 @@ impl MemoryStorage for PostgresMemoryStorage {
 /**
  * Convert a database row to a MemoryEntry.
  */
-fn row_to_memory_entry<R>(row: R) -> MemoryResult<MemoryEntry>
-where
-    R: Row,
-{
-    use sqlx::Column;
+fn row_to_memory_entry(row: sqlx::postgres::PgRow) -> MemoryResult<MemoryEntry> {
+    use sqlx::Row;
     
     let id: Uuid = row.try_get("id")?;
     let scope_str: String = row.try_get("scope")?;

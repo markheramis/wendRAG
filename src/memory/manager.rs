@@ -14,14 +14,14 @@
 use crate::memory::{
     buffer::{SessionBuffer, SessionConfig, SessionContext},
     retrieval::{build_memory_context, MemoryContext, MemoryRetriever},
-    storage::{MemoryStorage, MemoryStorageError, MaintenanceStats},
-    types::{ChatMessage, MemoryEntry, MemoryMetadata, MemoryScope, MemoryType, MessageRole},
+    storage::{MemoryStorage, MemoryStorageError},
+    types::{ChatMessage, MemoryEntry, MemoryScope, MemoryType, MessageRole},
     calculate_decayed_importance,
 };
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 /**
@@ -125,41 +125,42 @@ impl<S: MemoryStorage> MemoryManager<S> {
     // =========================================================================
 
     /**
-     * Get or create a session buffer.
+     * Get or create a session buffer and execute a closure with write access.
+     *
+     * This pattern avoids lifetime issues with DashMap references.
      */
-    pub async fn get_or_create_session(
-        &self,
-        session_id: &str,
-    ) -> Result<tokio::sync::RwLockWriteGuard<'_, SessionBuffer>, MemoryStorageError> {
-        // Check if session exists
+    async fn with_session_buffer<F, R>(&self, session_id: &str, f: F) -> Result<R, MemoryStorageError>
+    where
+        F: FnOnce(&mut SessionBuffer) -> R,
+    {
+        // Ensure session exists
         if !self.session_buffers.contains_key(session_id) {
-            // Create new session buffer
             let buffer = SessionBuffer::new(session_id, self.config.session.clone());
             self.session_buffers
                 .insert(session_id.to_string(), RwLock::new(buffer));
             info!("Created new session buffer: {}", session_id);
         }
 
-        // Get write lock on the buffer
+        // Get the lock guard
         let entry = self
             .session_buffers
             .get(session_id)
             .ok_or_else(|| MemoryStorageError::NotFound(Uuid::new_v4()))?;
 
-        Ok(entry.write().await)
+        let mut guard = entry.value().write().await;
+        let result = f(&mut guard);
+        Ok(result)
     }
 
     /**
-     * Get a read-only view of a session buffer.
+     * Get session context without holding a lock.
      */
-    pub async fn get_session(
-        &self,
-        session_id: &str,
-    ) -> Option<tokio::sync::RwLockReadGuard<'_, SessionBuffer>> {
+    pub async fn get_session_context(&self, session_id: &str) -> Option<SessionContext> {
         self.session_buffers
             .get(session_id)
-            .map(|entry| entry.value().try_read().ok())
-            .flatten()
+            .and_then(|entry| {
+                entry.value().try_read().ok().map(|guard| guard.get_context())
+            })
     }
 
     /**
@@ -173,14 +174,13 @@ impl<S: MemoryStorage> MemoryManager<S> {
         role: MessageRole,
         content: impl Into<String>,
     ) -> Result<bool, MemoryStorageError> {
-        let mut buffer = self.get_or_create_session(session_id).await?;
-        let message = ChatMessage::new(role, content);
-        let should_summarize = buffer.add_message(message);
-
-        // Apply sliding window if needed
-        buffer.apply_sliding_window();
-
-        Ok(should_summarize)
+        let content_str = content.into();
+        self.with_session_buffer(session_id, |buffer| {
+            let message = ChatMessage::new(role, content_str);
+            buffer.add_message(message);
+            buffer.apply_sliding_window();
+            buffer.message_count() >= buffer.config.max_messages
+        }).await
     }
 
     /**
@@ -191,9 +191,10 @@ impl<S: MemoryStorage> MemoryManager<S> {
         session_id: &str,
         summary: impl Into<String>,
     ) -> Result<(), MemoryStorageError> {
-        let mut buffer = self.get_or_create_session(session_id).await?;
-        buffer.summarize(summary);
-        Ok(())
+        let summary_str = summary.into();
+        self.with_session_buffer(session_id, |buffer| {
+            buffer.summarize(summary_str);
+        }).await
     }
 
     /**
@@ -233,8 +234,8 @@ impl<S: MemoryStorage> MemoryManager<S> {
                 let memory = self
                     .store_memory(
                         MemoryScope::User,
-                        session_id,
-                        user_id,
+                        Some(session_id.to_string()),
+                        user_id.map(|s| s.to_string()),
                         content,
                         MemoryType::Summary,
                         self.config.default_importance * 1.2, // Summaries are more important
@@ -320,7 +321,7 @@ impl<S: MemoryStorage> MemoryManager<S> {
         self.store_memory(
             MemoryScope::User,
             None::<String>,
-            user_id,
+            Some(user_id.to_string()),
             fact,
             MemoryType::Fact,
             importance,
@@ -341,7 +342,7 @@ impl<S: MemoryStorage> MemoryManager<S> {
             .store_memory(
                 MemoryScope::User,
                 None::<String>,
-                user_id,
+                Some(user_id.to_string()),
                 preference,
                 MemoryType::Preference,
                 importance,
@@ -373,16 +374,18 @@ impl<S: MemoryStorage> MemoryManager<S> {
         session_id: Option<&str>,
         user_id: Option<&str>,
     ) -> Result<MemoryContext, MemoryStorageError> {
-        // Get session buffer if provided
-        let session_buffer = if let Some(sid) = session_id {
-            self.get_session(sid).await.map(|b| b.clone())
+        // Get session buffer reference if provided
+        // Note: We can't hold the lock across await points, so we pass None for now
+        // TODO: Refactor build_memory_context to accept SessionContext instead of SessionBuffer
+        let _session_ctx = if let Some(sid) = session_id {
+            self.get_session_context(sid).await
         } else {
             None
         };
 
         // Build comprehensive context
         let context = build_memory_context(
-            session_buffer.as_ref(),
+            None, // session_buffer can't be held across await
             Arc::clone(&self.storage),
             query,
             user_id,

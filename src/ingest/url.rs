@@ -12,6 +12,85 @@ const URL_INGEST_USER_AGENT: &str = "wend-rag/0.1";
 const URL_FETCH_TIMEOUT_SECS: u64 = 30;
 
 /**
+ * Validates that a URL is safe to fetch (not a private/internal IP).
+ *
+ * Blocks requests to:
+ * - Private IP ranges (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+ * - Loopback addresses (127.x.x.x, ::1)
+ * - Link-local addresses (169.254.x.x)
+ *
+ * Parameters:
+ * - `url`: The parsed URL to validate.
+ *
+ * Returns:
+ * - `Ok(())` if the URL is safe to fetch.
+ * - `Err(ReadError)` if the URL points to a restricted address.
+ */
+fn validate_url_not_private(url: &Url) -> Result<(), ReadError> {
+    if let Some(host) = url.host() {
+        match host {
+            url::Host::Ipv4(ip) => {
+                if ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+                {
+                    return Err(ReadError::InvalidUrl {
+                        path: url.to_string(),
+                        reason: "URL points to a restricted/private IP address".to_string(),
+                    });
+                }
+            }
+            url::Host::Ipv6(ip) => {
+                if ip.is_loopback()
+                    || ip.is_multicast()
+                    || is_ipv6_unique_local(&ip)
+                    || is_ipv6_link_local(&ip)
+                {
+                    return Err(ReadError::InvalidUrl {
+                        path: url.to_string(),
+                        reason: "URL points to a restricted/private IP address".to_string(),
+                    });
+                }
+            }
+            url::Host::Domain(domain) => {
+                // Block localhost and common internal domains
+                let domain_lower = domain.to_lowercase();
+                if domain_lower == "localhost"
+                    || domain_lower.ends_with(".local")
+                    || domain_lower.ends_with(".internal")
+                    || domain_lower.ends_with(".localhost")
+                {
+                    return Err(ReadError::InvalidUrl {
+                        path: url.to_string(),
+                        reason: "URL points to a restricted domain".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/**
+ * Check if an IPv6 address is in the unique local address range (fc00::/7).
+ */
+fn is_ipv6_unique_local(ip: &std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    (segments[0] & 0xfe00) == 0xfc00
+}
+
+/**
+ * Check if an IPv6 address is link-local (fe80::/10).
+ */
+fn is_ipv6_link_local(ip: &std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    (segments[0] & 0xffc0) == 0xfe80
+}
+
+/**
  * Fetches a web document, enforces basic robots.txt checks, converts readable
  * HTML into markdown, and returns the normalized ingest payload.
  *
@@ -30,6 +109,9 @@ pub async fn read_url_document(path: &str) -> Result<ReadDocument, ReadError> {
         path: path.to_string(),
         reason: error.to_string(),
     })?;
+
+    // SECURITY: Validate URL doesn't point to private/internal addresses (SSRF protection)
+    validate_url_not_private(&parsed_url)?;
     let client: Client = Client::builder()
         .timeout(Duration::from_secs(URL_FETCH_TIMEOUT_SECS))
         .user_agent(URL_INGEST_USER_AGENT)
