@@ -4,5 +4,7 @@ pub mod embed;
 pub mod entity;
 pub mod ingest;
 pub mod mcp;
+pub mod observability;
+pub mod rerank;
 pub mod retrieve;
 pub mod store;

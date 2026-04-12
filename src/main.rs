@@ -4,16 +4,17 @@ use axum::response::IntoResponse;
 use clap::{Parser, Subcommand};
 use wend_rag::config::{Config, EmbeddingProviderKind, StorageBackendKind};
 use wend_rag::config_file::FileConfig;
-use wend_rag::embed::{self, OpenAiCompatProvider};
+use wend_rag::embed::{self, OllamaProvider, OpenAiCompatProvider};
 use wend_rag::entity::{EntityExtractor, OpenAiCompatEntityExtractor};
 use wend_rag::ingest::pipeline;
 use wend_rag::mcp::server::{ServerConfig, WendRagServer};
+use wend_rag::observability;
+use wend_rag::rerank::{self, RerankerProvider};
 use wend_rag::store;
 use rmcp::ServiceExt;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "wend-rag", version, about = "wendRAG — RAG-powered MCP server")]
@@ -41,10 +42,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    // Initialize observability with OpenTelemetry support
+    observability::init_tracing();
 
     let cli = Cli::parse();
 
@@ -68,11 +67,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let storage = store::initialize_backend(&cfg).await?;
 
-    let embedder: Arc<dyn embed::EmbeddingProvider> = Arc::new(OpenAiCompatProvider::new(
-        cfg.embedding_base_url.clone(),
-        cfg.embedding_api_key.clone(),
-        cfg.embedding_model.clone(),
-    ));
+    // Initialize embedder based on provider kind
+    let embedder: Arc<dyn embed::EmbeddingProvider> = match cfg.embedding_provider {
+        EmbeddingProviderKind::Ollama => Arc::new(OllamaProvider::new(
+            cfg.embedding_base_url.clone(),
+            cfg.embedding_model.clone(),
+        )),
+        _ => Arc::new(OpenAiCompatProvider::new(
+            cfg.embedding_base_url.clone(),
+            cfg.embedding_api_key.clone(),
+            cfg.embedding_model.clone(),
+        )),
+    };
     let entity_extractor: Option<Arc<dyn EntityExtractor>> =
         cfg.entity_extraction_enabled.then(|| {
             Arc::new(OpenAiCompatEntityExtractor::new(
@@ -81,6 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.entity_extraction_model.clone(),
             )) as Arc<dyn EntityExtractor>
         });
+
+    let reranker: Option<Arc<dyn RerankerProvider>> = cfg.reranker.enabled.then(|| {
+        tracing::info!(
+            provider = ?cfg.reranker.provider,
+            model = %cfg.reranker.model,
+            top_n = cfg.reranker.top_n,
+            "reranker enabled"
+        );
+        Arc::from(rerank::build_reranker(&cfg.reranker)) as Arc<dyn RerankerProvider>
+    });
 
     match cli.command {
         Command::Ingest { path } => {
@@ -98,11 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Daemon => {
             let host = cfg.host.clone();
             let port = cfg.port;
-            let server = build_server(cfg, storage, embedder, entity_extractor);
+            let server = build_server(cfg, storage, embedder, entity_extractor, reranker);
             serve_http(server, &host, port).await
         }
         Command::Stdio => {
-            let server = build_server(cfg, storage, embedder, entity_extractor);
+            let server = build_server(cfg, storage, embedder, entity_extractor, reranker);
             serve_stdio(server).await
         }
     }
@@ -117,6 +133,7 @@ fn build_server(
     storage: Arc<dyn store::StorageBackend>,
     embedder: Arc<dyn embed::EmbeddingProvider>,
     entity_extractor: Option<Arc<dyn EntityExtractor>>,
+    reranker: Option<Arc<dyn RerankerProvider>>,
 ) -> WendRagServer {
     let server_config = ServerConfig {
         storage_backend: match cfg.storage_backend {
@@ -127,6 +144,7 @@ fn build_server(
         embedding_provider: match cfg.embedding_provider {
             EmbeddingProviderKind::OpenAi => "openai",
             EmbeddingProviderKind::Voyage => "voyage",
+            EmbeddingProviderKind::Ollama => "ollama",
             EmbeddingProviderKind::OpenAiCompatible => "openai-compatible",
         }
         .to_string(),
@@ -141,12 +159,22 @@ fn build_server(
         }
         .to_string(),
         chunking_semantic_threshold: cfg.chunking_semantic_threshold,
+        reranker_enabled: cfg.reranker.enabled,
+        reranker_provider: match cfg.reranker.provider {
+            wend_rag::rerank::RerankerProviderKind::Cohere => "cohere",
+            wend_rag::rerank::RerankerProviderKind::Jina => "jina",
+            wend_rag::rerank::RerankerProviderKind::OpenAiCompatible => "openai-compatible",
+        }
+        .to_string(),
+        reranker_model: cfg.reranker.model.clone(),
     };
 
     WendRagServer::new(
         storage,
         embedder,
         entity_extractor,
+        reranker,
+        cfg.reranker.top_n,
         cfg.graph_settings,
         cfg.chunking_strategy,
         cfg.chunking_semantic_threshold,
@@ -156,8 +184,8 @@ fn build_server(
 
 /**
  * Executes the one-shot CLI ingestion mode and writes a JSON summary to stdout
- * so shell users can inspect or pipe the result. Supports local paths and
- * HTTP(S) URLs.
+ * so shell users can inspect or pipe the result. Logs per-file progress and an
+ * aggregate summary to stderr. Supports local paths and HTTP(S) URLs.
  */
 async fn run_cli_ingest(
     storage: &Arc<dyn store::StorageBackend>,
@@ -179,6 +207,15 @@ async fn run_cli_ingest(
         semantic_threshold,
     )
     .await?;
+
+    tracing::info!(
+        added = output.added,
+        updated = output.updated,
+        unchanged = output.unchanged,
+        deleted = output.deleted,
+        failed = output.failed,
+        "ingestion complete"
+    );
 
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
@@ -228,6 +265,7 @@ async fn health_handler() -> impl IntoResponse {
 /**
  * Waits for either ctrl_c (SIGINT) or SIGTERM, whichever arrives first, so
  * `axum::serve` can begin its graceful shutdown sequence.
+ * Also shuts down OpenTelemetry tracing gracefully.
  */
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
@@ -248,6 +286,9 @@ async fn shutdown_signal() {
         ctrl_c.await.ok();
         tracing::info!("received SIGINT, shutting down");
     }
+
+    // Flush OpenTelemetry spans before exiting
+    observability::shutdown_tracing();
 }
 
 /**

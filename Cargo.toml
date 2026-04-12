@@ -22,6 +22,8 @@ schemars = "1"
 
 pulldown-cmark = "0.13"
 pdf-extract = "0.10"
+docx-rs = "0.4"
+csv = "1"
 
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -34,7 +36,11 @@ async-trait = "0.1"
 thiserror = "2"
 
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.30"
+opentelemetry = "0.29"
+opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

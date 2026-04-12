@@ -58,10 +58,17 @@ pub async fn ingest_directory(
         }
     }
 
+    tracing::info!(
+        directory = %request.directory_path,
+        file_count = file_paths.len(),
+        "discovered files for ingestion"
+    );
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INGESTS));
     let mut tasks: JoinSet<(usize, String, Result<IngestResult, IngestError>)> = JoinSet::new();
 
     let options = options.clone();
+    let total_files = file_paths.len();
 
     for (index, path_string) in file_paths.iter().enumerate() {
         let storage = storage.clone();
@@ -71,6 +78,11 @@ pub async fn ingest_directory(
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         tasks.spawn(async move {
+            tracing::info!(
+                file = %path_string,
+                progress = format!("[{}/{}]", index + 1, total_files),
+                "ingesting"
+            );
             let result = ingest_file(
                 &storage,
                 &embedder,
@@ -139,6 +151,7 @@ pub(super) async fn ingest_single_path(
     file_path: &str,
     options: &IngestOptions,
 ) -> Result<IngestPathResult, IngestError> {
+    tracing::info!(file = %file_path, "ingesting");
     let result = ingest_file(
         storage,
         embedder,
@@ -182,7 +195,8 @@ fn build_directory_pattern(
 
 /**
  * Updates aggregate ingestion counters and records the per-document status line
- * for a file processed during CLI or MCP-driven ingestion.
+ * for a file processed during CLI or MCP-driven ingestion. Logs each result to
+ * stderr so the CLI user can follow progress in real time.
  */
 pub(super) fn push_ingest_status(
     output: &mut IngestPathResult,
@@ -192,6 +206,12 @@ pub(super) fn push_ingest_status(
     match result {
         Ok(result) => {
             let status = result.status.to_string();
+            tracing::info!(
+                file = %file_path,
+                status = %status,
+                chunks = result.chunk_count,
+                "done"
+            );
             match result.status {
                 IngestStatus::Created => output.added += 1,
                 IngestStatus::Updated => output.updated += 1,
@@ -203,6 +223,7 @@ pub(super) fn push_ingest_status(
             });
         }
         Err(error) => {
+            tracing::error!(file = %file_path, error = %error, "failed");
             output.failed += 1;
             output.documents.push(IngestDocumentStatus {
                 file_path: file_path.to_string(),

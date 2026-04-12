@@ -20,6 +20,7 @@ pub struct FileConfig {
     pub entity_extraction: EntityExtractionSection,
     pub graph: GraphSection,
     pub chunking: ChunkingSection,
+    pub reranker: RerankerSection,
     pub pool: PoolSection,
 }
 
@@ -69,6 +70,25 @@ pub struct GraphSection {
 pub struct ChunkingSection {
     pub strategy: Option<String>,
     pub semantic_threshold: Option<f64>,
+}
+
+/**
+ * Optional reranking stage configuration. When enabled, retrieval candidates
+ * are rescored through a cross-encoder or dedicated rerank API before being
+ * returned to the caller.
+ */
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RerankerSection {
+    pub enabled: Option<bool>,
+    /// `"cohere"`, `"jina"`, or `"openai-compatible"`.
+    pub provider: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    /// Number of candidates to pass to the reranker before trimming to the
+    /// caller's requested `top_k`.
+    pub top_n: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +201,13 @@ graph:
 chunking:
   strategy: "semantic"
   semantic_threshold: 0.30
+reranker:
+  enabled: true
+  provider: "cohere"
+  base_url: "https://api.cohere.com"
+  model: "rerank-v3.5"
+  api_key: "rerank-key"
+  top_n: 50
 pool:
   max_connections: 10
   acquire_timeout_secs: 30
@@ -201,6 +228,10 @@ pool:
         assert_eq!(cfg.graph.traversal_depth, Some(3));
         assert_eq!(cfg.chunking.strategy.as_deref(), Some("semantic"));
         assert_eq!(cfg.chunking.semantic_threshold, Some(0.30));
+        assert_eq!(cfg.reranker.enabled, Some(true));
+        assert_eq!(cfg.reranker.provider.as_deref(), Some("cohere"));
+        assert_eq!(cfg.reranker.model.as_deref(), Some("rerank-v3.5"));
+        assert_eq!(cfg.reranker.top_n, Some(50));
         assert_eq!(cfg.pool.max_connections, Some(10));
         assert_eq!(cfg.pool.acquire_timeout_secs, Some(30));
     }

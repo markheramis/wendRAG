@@ -26,6 +26,7 @@ use crate::entity::{EntityExtractor, GraphSettings};
 use crate::ingest::pipeline;
 use crate::ingest::pipeline::{ContentIngestRequest, DirectoryIngestRequest, IngestOptions};
 use crate::ingest::reader::detect_file_type;
+use crate::rerank::RerankerProvider;
 use crate::retrieve::{ScoredChunk, SearchMode};
 use crate::retrieve::{dense, hybrid, sparse};
 use crate::store::{SearchFilters, StorageBackend};
@@ -55,6 +56,9 @@ pub struct ServerConfig {
     pub graph_traversal_depth: u8,
     pub chunking_strategy: String,
     pub chunking_semantic_threshold: f64,
+    pub reranker_enabled: bool,
+    pub reranker_provider: String,
+    pub reranker_model: String,
 }
 
 #[derive(Clone)]
@@ -62,6 +66,9 @@ pub struct WendRagServer {
     pub(super) storage: Arc<dyn StorageBackend>,
     pub(super) embedder: Arc<dyn EmbeddingProvider>,
     entity_extractor: Option<Arc<dyn EntityExtractor>>,
+    reranker: Option<Arc<dyn RerankerProvider>>,
+    /// Number of candidates to pass to the reranker before trimming.
+    reranker_top_n: usize,
     graph_settings: GraphSettings,
     chunking_strategy: ChunkingStrategy,
     semantic_threshold: f64,
@@ -83,6 +90,8 @@ impl WendRagServer {
         storage: Arc<dyn StorageBackend>,
         embedder: Arc<dyn EmbeddingProvider>,
         entity_extractor: Option<Arc<dyn EntityExtractor>>,
+        reranker: Option<Arc<dyn RerankerProvider>>,
+        reranker_top_n: usize,
         graph_settings: GraphSettings,
         chunking_strategy: ChunkingStrategy,
         semantic_threshold: f64,
@@ -92,6 +101,8 @@ impl WendRagServer {
             storage,
             embedder,
             entity_extractor,
+            reranker,
+            reranker_top_n,
             graph_settings,
             chunking_strategy,
             semantic_threshold,
@@ -104,6 +115,14 @@ impl WendRagServer {
      * Executes the shared retrieval flow used by both context MCP tools and
      * applies the caller-provided score threshold before serialization.
      */
+    /**
+     * Executes the shared retrieval flow used by both context MCP tools.
+     *
+     * When a reranker is configured, the retrieval stage over-fetches
+     * `reranker_top_n` candidates, applies the optional score threshold,
+     * then reranks the survivors down to the caller's `top_k`. When no
+     * reranker is present the pipeline behaves exactly as before.
+     */
     async fn search_context_chunks(
         &self,
         input: &SearchInput,
@@ -113,7 +132,16 @@ impl WendRagServer {
             .as_deref()
             .map(SearchMode::from_str_loose)
             .unwrap_or(SearchMode::Hybrid);
-        let top_k = input.top_k.unwrap_or(10) as i64;
+        let requested_top_k = input.top_k.unwrap_or(10) as usize;
+
+        // Over-fetch when reranking is enabled so the reranker has enough
+        // candidates to choose from.
+        let retrieval_top_k = if self.reranker.is_some() {
+            self.reranker_top_n.max(requested_top_k) as i64
+        } else {
+            requested_top_k as i64
+        };
+
         let filters = SearchFilters {
             project: input.project.clone(),
             file_types: input.file_types.clone(),
@@ -131,18 +159,20 @@ impl WendRagServer {
                     Ok(_) => return Err("embedding returned empty".to_string()),
                     Err(error) => return Err(error.to_string()),
                 };
-                dense::search(&self.storage, &emb, top_k, &filters)
+                dense::search(&self.storage, &emb, retrieval_top_k, &filters)
                     .await
                     .map_err(|error| error.to_string())?
             }
-            SearchMode::Sparse => sparse::search(&self.storage, &input.query, top_k, &filters)
-                .await
-                .map_err(|error| error.to_string())?,
+            SearchMode::Sparse => {
+                sparse::search(&self.storage, &input.query, retrieval_top_k, &filters)
+                    .await
+                    .map_err(|error| error.to_string())?
+            }
             SearchMode::Hybrid => hybrid::search(
                 &self.storage,
                 &self.embedder,
                 &input.query,
-                top_k,
+                retrieval_top_k,
                 &filters,
                 self.graph_settings,
             )
@@ -150,7 +180,8 @@ impl WendRagServer {
             .map_err(|error| error.to_string())?,
         };
 
-        let filtered = results
+        // Apply caller-provided score threshold.
+        let mut filtered: Vec<ScoredChunk> = results
             .into_iter()
             .filter(|chunk| {
                 input
@@ -158,6 +189,44 @@ impl WendRagServer {
                     .is_none_or(|threshold| chunk.score >= threshold)
             })
             .collect();
+
+        // Rerank if a provider is configured.
+        if let Some(reranker) = &self.reranker {
+            let documents: Vec<String> = filtered.iter().map(|c| c.content.clone()).collect();
+
+            if !documents.is_empty() {
+                match reranker
+                    .rerank(&input.query, &documents, requested_top_k)
+                    .await
+                {
+                    Ok(reranked) => {
+                        let mut reordered: Vec<ScoredChunk> = reranked
+                            .into_iter()
+                            .filter_map(|r| {
+                                filtered.get(r.index).map(|chunk| {
+                                    let mut reranked_chunk = chunk.clone();
+                                    reranked_chunk.score = r.relevance_score;
+                                    reranked_chunk
+                                })
+                            })
+                            .collect();
+                        reordered.truncate(requested_top_k);
+                        filtered = reordered;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "reranker failed, falling back to original ranking"
+                        );
+                        // Graceful degradation: keep the original order but
+                        // trim to the requested top_k.
+                        filtered.truncate(requested_top_k);
+                    }
+                }
+            }
+        } else {
+            filtered.truncate(requested_top_k);
+        }
 
         Ok((mode, filtered))
     }
@@ -679,6 +748,9 @@ mod tests {
             graph_traversal_depth: 2,
             chunking_strategy: "fixed".to_string(),
             chunking_semantic_threshold: 0.25,
+            reranker_enabled: false,
+            reranker_provider: "none".to_string(),
+            reranker_model: String::new(),
         }
     }
 
@@ -696,6 +768,8 @@ mod tests {
             storage,
             embedder,
             None,
+            None,
+            30,
             GraphSettings::new(false, 2),
             crate::config::ChunkingStrategy::Fixed,
             0.25,

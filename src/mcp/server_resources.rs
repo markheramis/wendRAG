@@ -149,6 +149,9 @@ impl WendRagServer {
             "graph_traversal_depth": self.server_config.graph_traversal_depth,
             "chunking_strategy": self.server_config.chunking_strategy,
             "chunking_semantic_threshold": self.server_config.chunking_semantic_threshold,
+            "reranker_enabled": self.server_config.reranker_enabled,
+            "reranker_provider": self.server_config.reranker_provider,
+            "reranker_model": self.server_config.reranker_model,
         });
 
         Ok(ReadResourceResult::new(vec![ResourceContents::text(

@@ -52,6 +52,20 @@ chunking:
   # Percentile (0.0–1.0) for semantic chunk breaks
   semantic_threshold: 0.25
 
+reranker:
+  # Optional post-retrieval reranking stage for improved precision.
+  # When enabled, retrieval over-fetches candidates and rescores them
+  # through a cross-encoder or dedicated rerank API.
+  enabled: false
+  # "cohere", "jina", or "openai-compatible"
+  provider: "openai-compatible"
+  # base_url: "http://localhost:8787"
+  # model: "bge-reranker-v2-m3"
+  # Falls back to embedding.api_key if omitted
+  # api_key: ""
+  # Number of candidates to pass to the reranker (default: 30)
+  # top_n: 30
+
 # pool:
 #   max_connections: 20
 #   acquire_timeout_secs: 60

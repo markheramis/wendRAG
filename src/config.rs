@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::config_file::FileConfig;
 use crate::entity::{DEFAULT_GRAPH_TRAVERSAL_DEPTH, GraphSettings};
+use crate::rerank::{DEFAULT_RERANKER_TOP_N, RerankerConfig, RerankerProviderKind};
 
 const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 20;
 const DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 60;
@@ -12,6 +13,7 @@ pub enum EmbeddingProviderKind {
     OpenAi,
     Voyage,
     OpenAiCompatible,
+    Ollama,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,8 @@ pub struct Config {
     /// Percentile (0.0..1.0) below which similarity scores become chunk breaks.
     /// E.g. 0.25 means the bottom 25% of consecutive-sentence similarities are break points.
     pub chunking_semantic_threshold: f64,
+    /// Optional reranking stage applied after retrieval fusion.
+    pub reranker: RerankerConfig,
     pub pool: PoolConfig,
 }
 
@@ -92,7 +96,7 @@ pub enum ConfigError {
     MissingVar(#[from] env::VarError),
     #[error("invalid port number: {0}")]
     InvalidPort(#[from] std::num::ParseIntError),
-    #[error("unknown embedding provider: {0} (expected openai, voyage, or openai-compatible)")]
+    #[error("unknown embedding provider: {0} (expected openai, voyage, ollama, or openai-compatible)")]
     InvalidProvider(String),
     #[error("unknown storage backend: {0} (expected postgres or sqlite)")]
     InvalidStorageBackend(String),
@@ -169,6 +173,7 @@ impl Config {
         let provider = match provider_str.as_str() {
             "openai" => EmbeddingProviderKind::OpenAi,
             "voyage" => EmbeddingProviderKind::Voyage,
+            "ollama" => EmbeddingProviderKind::Ollama,
             "openai-compatible" => EmbeddingProviderKind::OpenAiCompatible,
             other => return Err(ConfigError::InvalidProvider(other.into())),
         };
@@ -178,6 +183,7 @@ impl Config {
                 ("https://api.openai.com", "text-embedding-3-small", 1536)
             }
             EmbeddingProviderKind::Voyage => ("https://api.voyageai.com", "voyage-3", 1024),
+            EmbeddingProviderKind::Ollama => ("http://localhost:11434", "nomic-embed-text", 768),
             EmbeddingProviderKind::OpenAiCompatible => ("http://localhost:1234", "default", 1536),
         };
 
@@ -287,6 +293,49 @@ impl Config {
         .or_else(|| yaml_or_env("WEND_RAG_EMBEDDING_API_KEY", fc.embedding.api_key.clone()))
         .unwrap_or_default();
 
+        let reranker_enabled_str = yaml_or_env(
+            "WEND_RAG_RERANKER_ENABLED",
+            fc.reranker.enabled.map(|b| b.to_string()),
+        );
+        let reranker_enabled = parse_loose_bool(reranker_enabled_str.as_deref(), false);
+
+        let reranker_provider_str = yaml_or_env(
+            "WEND_RAG_RERANKER_PROVIDER",
+            fc.reranker.provider.clone(),
+        )
+        .unwrap_or_else(|| "openai-compatible".into());
+        let reranker_provider = RerankerProviderKind::from_str(&reranker_provider_str)
+            .unwrap_or(RerankerProviderKind::OpenAiCompatible);
+
+        let reranker_base_url = yaml_or_env(
+            "WEND_RAG_RERANKER_BASE_URL",
+            fc.reranker.base_url.clone(),
+        )
+        .unwrap_or_default();
+
+        let reranker_model = yaml_or_env(
+            "WEND_RAG_RERANKER_MODEL",
+            fc.reranker.model.clone(),
+        )
+        .unwrap_or_else(|| "rerank-v3.5".into());
+
+        let reranker_api_key = yaml_or_env(
+            "WEND_RAG_RERANKER_API_KEY",
+            fc.reranker.api_key.clone(),
+        )
+        .or_else(|| yaml_or_env("WEND_RAG_EMBEDDING_API_KEY", fc.embedding.api_key.clone()))
+        .unwrap_or_default();
+
+        let reranker_top_n = fc
+            .reranker
+            .top_n
+            .or_else(|| {
+                env::var("WEND_RAG_RERANKER_TOP_N")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(DEFAULT_RERANKER_TOP_N);
+
         let pool_max_connections = fc
             .pool
             .max_connections
@@ -325,6 +374,14 @@ impl Config {
             graph_settings,
             chunking_strategy,
             chunking_semantic_threshold,
+            reranker: RerankerConfig {
+                enabled: reranker_enabled,
+                provider: reranker_provider,
+                base_url: reranker_base_url,
+                api_key: reranker_api_key,
+                model: reranker_model,
+                top_n: reranker_top_n,
+            },
             pool: PoolConfig {
                 max_connections: pool_max_connections,
                 acquire_timeout: Duration::from_secs(pool_acquire_timeout_secs),

@@ -16,6 +16,19 @@ services:
       timeout: 5s
       retries: 5
 
+  # Jaeger for OpenTelemetry trace visualization (optional)
+  jaeger:
+    image: jaegertracing/jaeger:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    profiles:
+      - observability
+
+  # Main wendRAG daemon service (production profile)
   wend-rag:
     build: .
     depends_on:
@@ -32,7 +45,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - D:/dentalray-knowledge-base:/data/docs:ro
+      - ${TEST_DOCS_PATH:-D:/dentalray-knowledge-base}:/data/docs:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 10s
@@ -40,5 +53,44 @@ services:
       start_period: 5s
       retries: 3
 
+  # Test service for running wendRAG CLI commands with PostgreSQL
+  wendrag-test:
+    build: .
+    environment:
+      WEND_RAG_STORAGE_BACKEND: postgres
+      WEND_RAG_DATABASE_URL: postgres://coderag:coderag@postgres:5432/coderag
+      WEND_RAG_EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai-compatible}
+      WEND_RAG_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://host.docker.internal:1234}
+      WEND_RAG_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      WEND_RAG_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: wendrag-test
+      RUST_LOG: debug
+    volumes:
+      - ${TEST_DOCS_PATH:-D:/dentalray-knowledge-base}:/test-docs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - test
+
+  # SQLite-only test service (no postgres dependency)
+  wendrag-sqlite:
+    build: .
+    environment:
+      WEND_RAG_STORAGE_BACKEND: sqlite
+      WEND_RAG_SQLITE_PATH: /data/wendrag.db
+      WEND_RAG_EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai-compatible}
+      WEND_RAG_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://host.docker.internal:1234}
+      WEND_RAG_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      WEND_RAG_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-nomic-embed-text}
+      RUST_LOG: debug
+    volumes:
+      - ${TEST_DOCS_PATH:-D:/dentalray-knowledge-base}:/test-docs:ro
+      - sqlite_data:/data
+    profiles:
+      - sqlite-test
+
 volumes:
   pgdata:
+  sqlite_data:

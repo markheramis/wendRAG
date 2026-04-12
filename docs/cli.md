@@ -1,59 +1,88 @@
 # CLI Reference
 
-The `wend-rag` binary runs either the MCP server or performs one-shot ingestion depending on the flags provided. All environment settings (storage backend, embeddings, chunking) apply in both modes.
+The `wend-rag` binary exposes subcommands for serving the MCP server or performing one-shot ingestion. All environment settings (storage backend, embeddings, chunking) apply in every mode.
 
-When running with Cargo, pass flags after `--` so they are not consumed by Cargo itself.
+When running with Cargo, pass subcommands after `--` so they are not consumed by Cargo itself.
 
-## Flags
+## Global Flags
 
 | Flag | Description |
 |------|-------------|
-| *(none)* | Start the MCP server. Transport is controlled by `MCP_TRANSPORT` (default `http`). |
-| `--stdio` | Force MCP **stdio** transport. Takes precedence over `MCP_TRANSPORT`. |
-| `--ingest <path>` | **One-shot ingestion**: ingest a local file or `http(s)` URL, print a JSON summary to stdout, then exit. |
-| `--ingest=<path>` | Same as `--ingest` with the path embedded in the argument. |
+| `-c, --config <path>` | Path to a YAML config file. |
 
-`--ingest` requires a path or URL immediately after the flag or after `=`.
+## Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `daemon` | Start the MCP server over Streamable HTTP. |
+| `stdio` | Start the MCP server over stdio transport. |
+| `ingest <path>` | One-shot ingestion of a file, directory, or HTTP(S) URL, then exit. |
 
 ## Examples
 
 ```bash
-# HTTP server (default)
-cargo run
+# HTTP server (daemon mode)
+cargo run -- daemon
 
 # Stdio MCP — for clients that spawn the process directly
-cargo run -- --stdio
+cargo run -- stdio
 
-# Ingest a local file
-cargo run -- --ingest path/to/file.md
-cargo run -- --ingest=path/to/file.md
+# Ingest a single file
+cargo run -- ingest path/to/file.md
+
+# Ingest an entire directory (recursive)
+cargo run -- ingest path/to/docs/
 
 # Ingest a remote URL
-cargo run -- --ingest https://example.com/article
+cargo run -- ingest https://example.com/article
 ```
 
 ### One-shot ingestion with Docker Compose
 
-Override the service command so the flags reach the binary rather than Docker:
+Override the service command so the subcommand reaches the binary rather than Docker:
 
 ```bash
-docker compose run --rm wend-rag wend-rag --ingest /data/docs/some-note.md
+docker compose run --rm wend-rag wend-rag ingest /data/docs/some-note.md
 ```
 
 Use a path that exists inside the container and matches the volume mounts declared in `compose.yml`.
 
-## Ingestion JSON output
+## Ingestion output
 
-When `--ingest` completes, a JSON summary is printed to stdout:
+### Progress (stderr)
+
+During ingestion, per-file status logs are written to **stderr** via the `tracing` framework so you can follow progress in real time. Example output:
+
+```
+2026-04-10T12:00:00.000Z  INFO wend_rag::ingest::directory: discovered files for ingestion directory="docs/" file_count=3
+2026-04-10T12:00:00.010Z  INFO wend_rag::ingest::directory: ingesting file="docs/intro.md" progress="[1/3]"
+2026-04-10T12:00:01.200Z  INFO wend_rag::ingest::directory: done file="docs/intro.md" status="created" chunks=5
+2026-04-10T12:00:01.210Z  INFO wend_rag::ingest::directory: ingesting file="docs/setup.md" progress="[2/3]"
+2026-04-10T12:00:02.100Z  INFO wend_rag::ingest::directory: done file="docs/setup.md" status="unchanged" chunks=0
+2026-04-10T12:00:02.110Z  INFO wend_rag::ingest::directory: ingesting file="docs/bad.xyz" progress="[3/3]"
+2026-04-10T12:00:02.120Z ERROR wend_rag::ingest::directory: failed file="docs/bad.xyz" error="unsupported file type: xyz"
+2026-04-10T12:00:02.130Z  INFO wend_rag: ingestion complete added=1 updated=0 unchanged=1 deleted=0 failed=1
+```
+
+Control the log level with the `RUST_LOG` environment variable (default: `info`).
+
+### JSON summary (stdout)
+
+When ingestion completes, a JSON summary is printed to **stdout**:
 
 ```json
 {
-  "file_path": "path/to/file.md",
-  "file_name": "file.md",
-  "file_type": "markdown",
-  "chunk_count": 12,
-  "skipped": false
+  "added": 1,
+  "updated": 0,
+  "unchanged": 1,
+  "deleted": 0,
+  "failed": 1,
+  "documents": [
+    { "file_path": "docs/intro.md", "status": "created" },
+    { "file_path": "docs/setup.md", "status": "unchanged" },
+    { "file_path": "docs/bad.xyz", "status": "error: unsupported file type: xyz" }
+  ]
 }
 ```
 
-`skipped: true` means the document content hash was unchanged since the last ingestion and no work was done.
+This makes it safe to pipe stdout into `jq` or another consumer while still watching progress on stderr.
