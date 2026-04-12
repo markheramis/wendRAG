@@ -1,0 +1,29 @@
+{
+  "project": "WendRAG",
+  "version": "0.1.0",
+  "features": {
+    "storage": ["postgresql", "sqlite"],
+    "embeddings": ["openai", "voyage", "ollama", "openai-compatible"],
+    "file_formats": ["markdown", "text", "pdf", "docx", "csv", "json", "url"]
+  },
+  "settings": {
+    "chunking": {
+      "strategy": "semantic",
+      "threshold": 0.25
+    },
+    "retrieval": {
+      "top_k": 10,
+      "reranker_enabled": true
+    }
+  },
+  "team": [
+    {
+      "name": "Developer 1",
+      "role": "Backend Engineer"
+    },
+    {
+      "name": "Developer 2",
+      "role": "ML Engineer"
+    }
+  ]
+}

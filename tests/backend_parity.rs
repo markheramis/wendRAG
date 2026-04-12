@@ -164,6 +164,8 @@ async fn backends_match_ingest_and_search_behaviour() -> TestResult<()> {
                 None,
                 ChunkingStrategy::Fixed,
                 0.25,
+                20,
+                true,
             ),
         )
         .await?;
@@ -193,6 +195,8 @@ async fn backends_match_ingest_and_search_behaviour() -> TestResult<()> {
                 None,
                 ChunkingStrategy::Fixed,
                 0.25,
+                20,
+                true,
             ),
         )
         .await?;
@@ -217,6 +221,8 @@ async fn backends_match_ingest_and_search_behaviour() -> TestResult<()> {
                 None,
                 ChunkingStrategy::Fixed,
                 0.25,
+                20,
+                true,
             ),
         )
         .await?;
@@ -350,6 +356,8 @@ async fn graph_retrieval_works_on_all_backends() -> TestResult<()> {
                 Some(&extractor),
                 ChunkingStrategy::Fixed,
                 0.25,
+                20,
+                true,
             ),
         )
         .await?;
@@ -368,6 +376,8 @@ async fn graph_retrieval_works_on_all_backends() -> TestResult<()> {
                 Some(&extractor),
                 ChunkingStrategy::Fixed,
                 0.25,
+                20,
+                true,
             ),
         )
         .await?;
@@ -459,14 +469,17 @@ async fn backends_return_ordered_document_chunks_for_full_context() -> TestResul
                 None,
                 ChunkingStrategy::Fixed,
                 0.25,
+                20,
+                false, // disable garbage filtering for this test
             ),
         )
         .await?;
 
         assert!(
             output.chunk_count > 1,
-            "{} backend should create multiple chunks for the long document",
-            harness.name
+            "{} backend should create multiple chunks for the long document, got {}",
+            harness.name,
+            output.chunk_count
         );
 
         let chunks = harness.storage.get_document_chunks(&file_path).await?;
@@ -524,6 +537,8 @@ async fn url_ingestion_works_on_all_backends() -> TestResult<()> {
             &no_tags,
             ChunkingStrategy::Fixed,
             0.25,
+            20,
+            true,
         )
         .await?;
 
@@ -605,6 +620,8 @@ async fn url_ingestion_respects_robots_txt() -> TestResult<()> {
             &no_tags,
             ChunkingStrategy::Fixed,
             0.25,
+            20,
+            true,
         )
         .await
         .expect_err("robots.txt should block URL ingestion");
@@ -834,6 +851,8 @@ async fn run_incremental_sync_test(harness: &BackendHarness) -> TestResult<()> {
         None,
         ChunkingStrategy::Fixed,
         0.25,
+        20,
+        true,
     );
 
     // ── First ingest: both files should be "created" ─────────────────────
@@ -999,3 +1018,4 @@ impl BackendHarness {
         Ok(())
     }
 }
+

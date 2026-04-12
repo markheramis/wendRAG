@@ -51,6 +51,11 @@ chunking:
   strategy: "fixed"
   # Percentile (0.0–1.0) for semantic chunk breaks
   semantic_threshold: 0.25
+  # Maximum sentences per chunk (semantic chunking hard boundary)
+  # Forces a split at this limit even if semantic similarity is high
+  max_sentences: 20
+  # Enable garbage/boilerplate pre-filtering (removes navigation, ads, etc.)
+  filter_garbage: true
 
 reranker:
   # Optional post-retrieval reranking stage for improved precision.

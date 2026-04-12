@@ -56,6 +56,8 @@ pub struct ServerConfig {
     pub graph_traversal_depth: u8,
     pub chunking_strategy: String,
     pub chunking_semantic_threshold: f64,
+    pub chunking_max_sentences: usize,
+    pub chunking_filter_garbage: bool,
     pub reranker_enabled: bool,
     pub reranker_provider: String,
     pub reranker_model: String,
@@ -72,6 +74,10 @@ pub struct WendRagServer {
     graph_settings: GraphSettings,
     chunking_strategy: ChunkingStrategy,
     semantic_threshold: f64,
+    /// Maximum sentences per chunk for semantic chunking.
+    chunking_max_sentences: usize,
+    /// Enables pre-filtering of garbage/boilerplate content.
+    chunking_filter_garbage: bool,
     pub(super) server_config: ServerConfig,
     tool_router: ToolRouter<Self>,
 }
@@ -95,6 +101,8 @@ impl WendRagServer {
         graph_settings: GraphSettings,
         chunking_strategy: ChunkingStrategy,
         semantic_threshold: f64,
+        chunking_max_sentences: usize,
+        chunking_filter_garbage: bool,
         server_config: ServerConfig,
     ) -> Self {
         Self {
@@ -106,6 +114,8 @@ impl WendRagServer {
             graph_settings,
             chunking_strategy,
             semantic_threshold,
+            chunking_max_sentences,
+            chunking_filter_garbage,
             server_config,
             tool_router: Self::tool_router(),
         }
@@ -315,6 +325,8 @@ impl WendRagServer {
                     self.entity_extractor.as_ref(),
                     self.chunking_strategy,
                     self.semantic_threshold,
+                    self.chunking_max_sentences,
+                    self.chunking_filter_garbage,
                 ),
             )
             .await
@@ -328,6 +340,8 @@ impl WendRagServer {
                 &tags,
                 self.chunking_strategy,
                 self.semantic_threshold,
+                self.chunking_max_sentences,
+                self.chunking_filter_garbage,
             )
             .await
         } else {
@@ -373,6 +387,8 @@ impl WendRagServer {
                 self.entity_extractor.as_ref(),
                 self.chunking_strategy,
                 self.semantic_threshold,
+                self.chunking_max_sentences,
+                self.chunking_filter_garbage,
             ),
         )
         .await
@@ -425,6 +441,8 @@ impl WendRagServer {
             let project = project.clone();
             let chunking_strategy = self.chunking_strategy;
             let semantic_threshold = self.semantic_threshold;
+            let chunking_max_sentences = self.chunking_max_sentences;
+            let chunking_filter_garbage = self.chunking_filter_garbage;
             let permit = semaphore.clone().acquire_owned().await.unwrap();
 
             tasks.spawn(async move {
@@ -443,6 +461,8 @@ impl WendRagServer {
                         entity_extractor.as_ref(),
                         chunking_strategy,
                         semantic_threshold,
+                        chunking_max_sentences,
+                        chunking_filter_garbage,
                     ),
                 )
                 .await;
@@ -748,6 +768,8 @@ mod tests {
             graph_traversal_depth: 2,
             chunking_strategy: "fixed".to_string(),
             chunking_semantic_threshold: 0.25,
+            chunking_max_sentences: 20,
+            chunking_filter_garbage: true,
             reranker_enabled: false,
             reranker_provider: "none".to_string(),
             reranker_model: String::new(),
@@ -773,6 +795,8 @@ mod tests {
             GraphSettings::new(false, 2),
             crate::config::ChunkingStrategy::Fixed,
             0.25,
+            20,
+            true,
             test_server_config(),
         );
         (server, tmpfile)

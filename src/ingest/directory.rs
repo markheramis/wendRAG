@@ -92,6 +92,8 @@ pub async fn ingest_directory(
                 &options.tags,
                 options.chunking_strategy,
                 options.semantic_threshold,
+                options.max_sentences,
+                options.filter_garbage,
             )
             .await;
             drop(permit);
@@ -161,6 +163,8 @@ pub(super) async fn ingest_single_path(
         &options.tags,
         options.chunking_strategy,
         options.semantic_threshold,
+        options.max_sentences,
+        options.filter_garbage,
     )
     .await?;
 

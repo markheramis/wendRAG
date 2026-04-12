@@ -80,6 +80,8 @@ pub struct IngestOptions {
     pub entity_extractor: Option<Arc<dyn EntityExtractor>>,
     pub chunking_strategy: ChunkingStrategy,
     pub semantic_threshold: f64,
+    pub max_sentences: usize,
+    pub filter_garbage: bool,
 }
 
 impl IngestOptions {
@@ -93,6 +95,8 @@ impl IngestOptions {
         entity_extractor: Option<&Arc<dyn EntityExtractor>>,
         chunking_strategy: ChunkingStrategy,
         semantic_threshold: f64,
+        max_sentences: usize,
+        filter_garbage: bool,
     ) -> Self {
         Self {
             project: project.map(ToOwned::to_owned),
@@ -100,6 +104,8 @@ impl IngestOptions {
             entity_extractor: entity_extractor.cloned(),
             chunking_strategy,
             semantic_threshold,
+            max_sentences,
+            filter_garbage,
         }
     }
 }

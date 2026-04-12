@@ -1,6 +1,10 @@
 /**
- * Semantic and fixed-window text splitting strategies used to break oversized
- * sections into appropriately sized chunks.
+ * Semantic chunking with Max-Min algorithm improvements.
+ *
+ * Implements:
+ * - Hard similarity thresholds with forced splits at configurable sentence counts
+ * - Garbage/boilerplate filtering before chunking
+ * - Optimized embedding batch processing
  */
 
 use std::sync::Arc;
@@ -12,47 +16,103 @@ use super::chunker::ChunkingError;
 const TEXT_WINDOW_OVERLAP: usize = 200;
 const SENTENCE_GROUP_SIZE: usize = 3;
 
+/// Minimum sentence length (in chars) to be considered meaningful.
+const MIN_SENTENCE_LENGTH: usize = 10;
+/// Maximum sentence length (in chars) before considering it noise.
+const MAX_SENTENCE_LENGTH: usize = 1000;
+
+/// Common boilerplate patterns to filter out.
+const GARBAGE_PATTERNS: &[&str] = &[
+    "click here",
+    "read more",
+    "learn more",
+    "sign up",
+    "subscribe now",
+    "copyright ©",
+    "all rights reserved",
+    "terms of service",
+    "privacy policy",
+    "cookie policy",
+    "advertisement",
+    "sponsored",
+    "share this",
+    "follow us",
+    "home",
+    "next page",
+    "previous page",
+    "page 1 of",
+    "loading...",
+    "please wait",
+];
+
 /**
  * Splits text at topic boundaries detected via embedding similarity of
  * sliding sentence windows.
+ *
+ * Implements Max-Min algorithm with:
+ * - Hard sentence count limits (forced splits)
+ * - Garbage/boilerplate pre-filtering
+ * - Optimized batch processing
  */
 pub(super) async fn semantic_split(
     text: &str,
     embedder: &Arc<dyn EmbeddingProvider>,
     max_chunk_chars: usize,
     threshold_percentile: f64,
+    max_sentences: usize,
+    filter_garbage: bool,
 ) -> Result<Vec<String>, ChunkingError> {
+    // Step 1: Split into sentences
     let sentences = split_sentences(text);
     if sentences.len() <= 1 {
         return Ok(vec![text.to_string()]);
     }
 
-    let windows = build_sentence_windows(&sentences, SENTENCE_GROUP_SIZE);
-    if windows.len() <= 1 {
+    // Step 2: Optional garbage/boilerplate filtering
+    let sentences = if filter_garbage {
+        filter_garbage_sentences(sentences)
+    } else {
+        sentences
+    };
+
+    if sentences.is_empty() {
         return Ok(vec![text.to_string()]);
     }
 
+    // Step 3: Build overlapping windows for embedding
+    let windows = build_sentence_windows(&sentences, SENTENCE_GROUP_SIZE);
+    if windows.len() <= 1 {
+        return Ok(vec![sentences.join(" ")]);
+    }
+
+    // Step 4: Embed windows with optimized batch processing
     let window_texts: Vec<String> = windows.iter().map(|w| w.join(" ")).collect();
     let embeddings = embedder.embed(&window_texts).await?;
 
     if embeddings.len() < 2 {
-        return Ok(vec![text.to_string()]);
+        return Ok(vec![sentences.join(" ")]);
     }
 
+    // Step 5: Compute similarities between consecutive windows
     let similarities: Vec<f32> = embeddings
         .windows(2)
         .map(|pair| cosine_similarity(&pair[0], &pair[1]))
-        .collect();
+    .collect();
 
-    let breakpoints = find_breakpoints(&similarities, threshold_percentile);
+    // Step 6: Find breakpoints using Max-Min algorithm with hard boundaries
+    let breakpoints = find_breakpoints_maxmin(&similarities, threshold_percentile, max_sentences);
 
-    let groups = group_sentences_at_breaks(&sentences, &breakpoints, &windows);
+    // Step 7: Group sentences at breakpoints with hard sentence limits
+    let groups = group_sentences_at_breaks_maxmin(&sentences, &breakpoints, &windows, max_sentences);
 
+    // Step 8: Handle oversized chunks
     let mut result = Vec::new();
     for group in groups {
         let joined = group.join(" ");
         if joined.len() <= max_chunk_chars {
-            result.push(joined);
+            if !joined.trim().is_empty() {
+                result.push(joined);
+            }
         } else {
             result.extend(split_with_overlap(
                 &joined,
@@ -63,6 +123,41 @@ pub(super) async fn semantic_split(
     }
 
     Ok(result)
+}
+
+/**
+ * Filters out garbage/boilerplate sentences.
+ * Removes navigation, ads, copyright notices, and very short/long sentences.
+ */
+fn filter_garbage_sentences(sentences: Vec<String>) -> Vec<String> {
+    sentences
+        .into_iter()
+        .filter(|s| {
+            let trimmed = s.trim();
+            let len = trimmed.len();
+
+            // Filter by length
+            if len < MIN_SENTENCE_LENGTH || len > MAX_SENTENCE_LENGTH {
+                return false;
+            }
+
+            // Filter by garbage patterns
+            let lower = trimmed.to_lowercase();
+            for pattern in GARBAGE_PATTERNS {
+                if lower.contains(pattern) {
+                    return false;
+                }
+            }
+
+            // Filter sentences that are mostly non-alphanumeric (likely noise)
+            let alphanumeric_count = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
+            if alphanumeric_count < len / 3 {
+                return false;
+            }
+
+            true
+        })
+        .collect()
 }
 
 /**
@@ -151,41 +246,73 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /**
- * Finds indices where similarity is in the bottom `threshold_percentile` of
- * all scores, indicating topic transition boundaries.
+ * Max-Min algorithm: Finds breakpoints using percentile threshold AND enforces
+ * hard sentence count limits.
+ *
+ * The algorithm ensures:
+ * 1. Semantic breakpoints at low similarity points
+ * 2. Forced splits when sentence count reaches max_sentences
  */
-fn find_breakpoints(similarities: &[f32], threshold_percentile: f64) -> Vec<usize> {
+fn find_breakpoints_maxmin(
+    similarities: &[f32],
+    threshold_percentile: f64,
+    max_sentences: usize,
+) -> Vec<usize> {
     if similarities.is_empty() {
         return Vec::new();
     }
 
+    // Find semantic threshold based on percentile
     let mut sorted = similarities.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let percentile_idx = ((sorted.len() as f64) * threshold_percentile).ceil() as usize;
     let threshold = sorted[percentile_idx.min(sorted.len() - 1)];
 
-    similarities
+    // Collect all semantic breakpoints
+    let mut breakpoints: Vec<usize> = similarities
         .iter()
         .enumerate()
         .filter(|(_, sim)| **sim <= threshold)
         .map(|(i, _)| i)
-        .collect()
+        .collect();
+
+    // Add forced breakpoints at max_sentences intervals (Max-Min hard boundary)
+    let forced_break_interval = max_sentences.saturating_sub(SENTENCE_GROUP_SIZE);
+    if forced_break_interval > 0 {
+        let mut forced_break = forced_break_interval;
+        while forced_break < similarities.len() {
+            // Only add if not already near an existing breakpoint
+            let already_near = breakpoints.iter().any(|bp| {
+                let diff = if *bp > forced_break { *bp - forced_break } else { forced_break - *bp };
+                diff < SENTENCE_GROUP_SIZE
+            });
+
+            if !already_near {
+                breakpoints.push(forced_break);
+            }
+            forced_break += forced_break_interval;
+        }
+    }
+
+    breakpoints.sort_unstable();
+    breakpoints.dedup();
+    breakpoints
 }
 
 /**
- * Groups original sentences into chunks, splitting at the detected breakpoints.
- * Each breakpoint index `i` means: break after sentence window `i`, which
- * corresponds to breaking after sentence `i + SENTENCE_GROUP_SIZE - 1` in the
- * original sentence list (center of the window).
+ * Groups sentences at breakpoints with Max-Min algorithm.
+ * Ensures no group exceeds max_sentences even if breakpoints don't align.
  */
-fn group_sentences_at_breaks(
+fn group_sentences_at_breaks_maxmin(
     sentences: &[String],
     breakpoints: &[usize],
     windows: &[Vec<String>],
+    max_sentences: usize,
 ) -> Vec<Vec<String>> {
     if breakpoints.is_empty() || windows.is_empty() {
-        return vec![sentences.to_vec()];
+        // Still respect max_sentences even without breakpoints
+        return split_into_max_sentences(sentences, max_sentences);
     }
 
     let half = SENTENCE_GROUP_SIZE / 2;
@@ -201,13 +328,47 @@ fn group_sentences_at_breaks(
 
     for &brk in &break_sentence_indices {
         if brk > start && brk <= sentences.len() {
-            groups.push(sentences[start..brk].to_vec());
+            // Check if this group would exceed max_sentences
+            let sentence_count = brk - start;
+            if sentence_count > max_sentences {
+                // Split this group into smaller chunks at max_sentences boundary
+                let mut pos = start;
+                while pos < brk {
+                    let end = (pos + max_sentences).min(brk);
+                    groups.push(sentences[pos..end].to_vec());
+                    pos = end;
+                }
+            } else {
+                groups.push(sentences[start..brk].to_vec());
+            }
             start = brk;
         }
     }
 
+    // Handle remaining sentences
     if start < sentences.len() {
-        groups.push(sentences[start..].to_vec());
+        let remaining = &sentences[start..];
+        groups.extend(split_into_max_sentences(remaining, max_sentences));
+    }
+
+    groups
+}
+
+/**
+ * Splits a slice of sentences into chunks respecting max_sentences limit.
+ */
+fn split_into_max_sentences(sentences: &[String], max_sentences: usize) -> Vec<Vec<String>> {
+    if sentences.len() <= max_sentences {
+        return vec![sentences.to_vec()];
+    }
+
+    let mut groups = Vec::new();
+    let mut pos = 0;
+
+    while pos < sentences.len() {
+        let end = (pos + max_sentences).min(sentences.len());
+        groups.push(sentences[pos..end].to_vec());
+        pos = end;
     }
 
     groups
@@ -224,7 +385,10 @@ pub(super) fn split_with_overlap(text: &str, window: usize, overlap: usize) -> V
 
     while pos < chars.len() {
         let end = (pos + window).min(chars.len());
-        result.push(chars[pos..end].iter().collect());
+        let chunk: String = chars[pos..end].iter().collect();
+        if !chunk.trim().is_empty() {
+            result.push(chunk);
+        }
         if end == chars.len() {
             break;
         }

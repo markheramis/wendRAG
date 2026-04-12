@@ -107,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &path,
                 cfg.chunking_strategy,
                 cfg.chunking_semantic_threshold,
+                cfg.chunking_max_sentences,
+                cfg.chunking_filter_garbage,
             )
             .await?;
             Ok(())
@@ -159,6 +161,8 @@ fn build_server(
         }
         .to_string(),
         chunking_semantic_threshold: cfg.chunking_semantic_threshold,
+        chunking_max_sentences: cfg.chunking_max_sentences,
+        chunking_filter_garbage: cfg.chunking_filter_garbage,
         reranker_enabled: cfg.reranker.enabled,
         reranker_provider: match cfg.reranker.provider {
             wend_rag::rerank::RerankerProviderKind::Cohere => "cohere",
@@ -178,6 +182,8 @@ fn build_server(
         cfg.graph_settings,
         cfg.chunking_strategy,
         cfg.chunking_semantic_threshold,
+        cfg.chunking_max_sentences,
+        cfg.chunking_filter_garbage,
         server_config,
     )
 }
@@ -194,6 +200,8 @@ async fn run_cli_ingest(
     path: &str,
     chunking_strategy: wend_rag::config::ChunkingStrategy,
     semantic_threshold: f64,
+    max_sentences: usize,
+    filter_garbage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tags: Vec<String> = Vec::new();
     let output = pipeline::ingest_path(
@@ -205,6 +213,8 @@ async fn run_cli_ingest(
         &tags,
         chunking_strategy,
         semantic_threshold,
+        max_sentences,
+        filter_garbage,
     )
     .await?;
 

@@ -1,0 +1,6 @@
+Name,Role,Department,Years Experience,Skills
+Alice Johnson,Software Engineer,Engineering,5,"Rust, Python, PostgreSQL"
+Bob Smith,Product Manager,Product,8,"Agile, Roadmapping, Analytics"
+Charlie Brown,Data Scientist,Data Science,3,"Python, Machine Learning, SQL"
+Diana Prince,DevOps Engineer,Infrastructure,6,"Docker, Kubernetes, AWS"
+Eve Davis,UX Designer,Design,4,"Figma, User Research, Prototyping"

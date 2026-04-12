@@ -64,6 +64,13 @@ pub struct Config {
     /// Percentile (0.0..1.0) below which similarity scores become chunk breaks.
     /// E.g. 0.25 means the bottom 25% of consecutive-sentence similarities are break points.
     pub chunking_semantic_threshold: f64,
+    /// Maximum number of sentences per chunk for semantic chunking.
+    /// Forces a split when this limit is reached, even if semantic similarity is high.
+    /// Default: 20 sentences. This prevents overly long chunks.
+    pub chunking_max_sentences: usize,
+    /// Enables pre-filtering of garbage/boilerplate content before chunking.
+    /// Filters navigation links, ads, copyright notices, and very short/long sentences.
+    pub chunking_filter_garbage: bool,
     /// Optional reranking stage applied after retrieval fusion.
     pub reranker: RerankerConfig,
     pub pool: PoolConfig,
@@ -231,6 +238,26 @@ impl Config {
             })
             .unwrap_or(0.25);
 
+        let chunking_max_sentences = fc
+            .chunking
+            .max_sentences
+            .or_else(|| {
+                env::var("WEND_RAG_CHUNKING_MAX_SENTENCES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(20);
+
+        let chunking_filter_garbage = fc
+            .chunking
+            .filter_garbage
+            .or_else(|| {
+                env::var("WEND_RAG_CHUNKING_FILTER_GARBAGE")
+                    .ok()
+                    .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            })
+            .unwrap_or(true);
+
         let host = yaml_or_env("WEND_RAG_HOST", fc.server.host.clone())
             .unwrap_or_else(|| "0.0.0.0".into());
 
@@ -374,6 +401,8 @@ impl Config {
             graph_settings,
             chunking_strategy,
             chunking_semantic_threshold,
+            chunking_max_sentences,
+            chunking_filter_garbage,
             reranker: RerankerConfig {
                 enabled: reranker_enabled,
                 provider: reranker_provider,

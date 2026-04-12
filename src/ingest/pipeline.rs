@@ -36,6 +36,8 @@ pub async fn ingest_path(
     tags: &[String],
     chunking_strategy: ChunkingStrategy,
     semantic_threshold: f64,
+    max_sentences: usize,
+    filter_garbage: bool,
 ) -> Result<IngestPathResult, IngestError> {
     let options = IngestOptions::new(
         project,
@@ -43,6 +45,8 @@ pub async fn ingest_path(
         entity_extractor,
         chunking_strategy,
         semantic_threshold,
+        max_sentences,
+        filter_garbage,
     );
     if detect_file_type(path) == Some("url") {
         return ingest_single_path(storage, embedder, path, &options).await;
@@ -85,6 +89,8 @@ pub async fn ingest_file(
     tags: &[String],
     chunking_strategy: ChunkingStrategy,
     semantic_threshold: f64,
+    max_sentences: usize,
+    filter_garbage: bool,
 ) -> Result<IngestResult, IngestError> {
     let source = read_source(file_path).await?;
     let options = IngestOptions::new(
@@ -93,6 +99,8 @@ pub async fn ingest_file(
         entity_extractor,
         chunking_strategy,
         semantic_threshold,
+        max_sentences,
+        filter_garbage,
     );
 
     ingest_content(
@@ -138,6 +146,8 @@ pub async fn ingest_content(
         options.chunking_strategy,
         Some(embedder),
         options.semantic_threshold,
+        options.max_sentences,
+        options.filter_garbage,
     )
     .await?;
 

@@ -1,0 +1,13 @@
+WendRAG Sample Text File
+
+This is a plain text document for testing text file ingestion.
+
+Plain text files are commonly used for:
+- Configuration files
+- Log files
+- Documentation
+- Notes
+
+The ingestion pipeline should handle these files by reading them as UTF-8 text and chunking them appropriately for embedding.
+
+End of sample text file.

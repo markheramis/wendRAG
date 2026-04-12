@@ -70,6 +70,10 @@ pub struct GraphSection {
 pub struct ChunkingSection {
     pub strategy: Option<String>,
     pub semantic_threshold: Option<f64>,
+    /// Maximum sentences per chunk. Forces a hard split at this limit.
+    pub max_sentences: Option<usize>,
+    /// Enables pre-filtering of garbage/boilerplate content.
+    pub filter_garbage: Option<bool>,
 }
 
 /**
