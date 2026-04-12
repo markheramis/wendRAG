@@ -68,14 +68,23 @@ pub fn detect_communities(
 
     // Build adjacency list representation (sparse, memory-efficient)
     let graph = build_sparse_graph(entities, relationships);
-    
+
+    // Debug logging using node_index for introspection
+    tracing::debug!(
+        "Built sparse graph with {} nodes and {} edges",
+        graph.node_count(),
+        graph.total_weight / 2.0
+    );
+
     // Run optimized Louvain algorithm
     let communities = louvain_clustering(&graph, config);
+
+    tracing::debug!("Detected {} communities from {} entities", communities.len(), entities.len());
     
     // Convert to output format
     communities
         .into_iter()
-        .map(|(community_id, node_indices)| {
+        .map(|(_community_id, node_indices)| {
             let entity_ids: Vec<String> = node_indices
                 .iter()
                 .filter_map(|&idx| entities.get(idx))
@@ -100,12 +109,54 @@ pub fn detect_communities(
 struct SparseGraph {
     /// Map from node index to list of (neighbor_index, weight)
     adjacency: Vec<Vec<(usize, f32)>>,
-    /// Map from normalized entity name to node index
+    /// Map from normalized entity name to node index.
+    /// Enables reverse lookup from index to entity name for community naming and debugging.
     node_index: HashMap<String, usize>,
     /// Total weight of all edges (2 * sum of all edge weights, since undirected)
     total_weight: f64,
     /// Weighted degree of each node
     node_degrees: Vec<f64>,
+}
+
+impl SparseGraph {
+    /**
+     * Returns the number of entities in the graph.
+     *
+     * Used for introspection and validation during community detection.
+     */
+    fn node_count(&self) -> usize {
+        self.node_index.len()
+    }
+
+    /**
+     * Returns the entity name for a given node index.
+     *
+     * FUTURE USE: Reverse lookup for graph serialization/persistence.
+     * When saving/loading SparseGraph without the original entities slice,
+     * this enables decoding node indices back to entity names.
+     *
+     * Also useful for debugging community detection at the algorithm level
+     * where only the graph (not the external entities slice) is available.
+     */
+    #[allow(dead_code)]
+    fn get_entity_name(&self, index: usize) -> Option<&String> {
+        self.node_index
+            .iter()
+            .find(|&(_, idx)| idx == &index)
+            .map(|(name, _)| name)
+    }
+
+    /**
+     * Returns all entity names in the graph.
+     *
+     * FUTURE USE: Debug logging and graph introspection without external data.
+     * Enables validation and logging during community detection when the
+     * original entities slice is not available.
+     */
+    #[allow(dead_code)]
+    fn entity_names(&self) -> Vec<&String> {
+        self.node_index.keys().collect()
+    }
 }
 
 fn build_sparse_graph(

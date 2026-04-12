@@ -52,9 +52,7 @@ pub struct Config {
     pub embedding_api_key: String,
     pub embedding_base_url: String,
     pub embedding_model: String,
-    #[allow(dead_code)]
     pub embedding_provider: EmbeddingProviderKind,
-    #[allow(dead_code)]
     pub embedding_dimensions: usize,
     pub entity_extraction_enabled: bool,
     pub entity_extraction_base_url: String,

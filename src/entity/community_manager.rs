@@ -125,8 +125,8 @@ impl CommunityManager {
     ) -> Result<Vec<CommunityWithSummary>, CommunityManagerError> {
         let mut results = Vec::with_capacity(communities.len());
 
-        // Create entity lookup for fast access
-        let entity_map: HashMap<&str, &EntityNode> = all_entities
+        // Create entity lookup for fast access (kept for potential optimization)
+        let _entity_map: HashMap<&str, &EntityNode> = all_entities
             .iter()
             .map(|e| (e.normalized_name.as_str(), e))
             .collect();
@@ -238,19 +238,15 @@ impl CommunityManager {
         top_k_communities: usize,
     ) -> TwoTierRetrievalResult {
         // Local tier: Find communities containing seed entities
-        let local_communities: Vec<_> = communities
-            .iter()
-            .filter(|c| {
+        let local_communities: Vec<_> = communities.iter().filter(|c| {
                 c.community
                     .entity_ids
                     .iter()
                     .any(|e| seed_entity_names.contains(e))
-            })
-            .cloned()
-            .collect();
+        }).cloned().collect();
 
         // Global tier: Find communities matching query embedding
-        let global_communities = self.rank_communities_by_embedding(communities, query_embedding, top_k_communities);
+        let global_communities: Vec<CommunityWithSummary> = self.rank_communities_by_embedding(communities, query_embedding, top_k_communities);
 
         TwoTierRetrievalResult {
             local: local_communities,
@@ -268,15 +264,12 @@ impl CommunityManager {
         query_embedding: &[f32],
         top_k: usize,
     ) -> Vec<CommunityWithSummary> {
-        let mut scored: Vec<(f32, CommunityWithSummary)> = communities
-            .iter()
-            .filter_map(|c| {
-                c.summary_embedding.as_ref().map(|emb| {
-                    let similarity = cosine_similarity(query_embedding, emb);
-                    (similarity, c.clone())
-                })
+        let mut scored: Vec<(f32, CommunityWithSummary)> = communities.iter().filter_map(|c| {
+            c.summary_embedding.as_ref().map(|emb| {
+                let similarity = cosine_similarity(query_embedding, emb);
+                (similarity, c.clone())
             })
-            .collect();
+        }).collect();
 
         // Sort by similarity descending
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -328,17 +321,13 @@ fn calculate_importance(entity_ids: &[String], relationships: &[EntityEdge]) -> 
 
     let entity_set: HashSet<&str> = entity_ids.iter().map(|s| s.as_str()).collect();
 
-    let internal_relationships: f32 = relationships
-        .iter()
-        .filter(|edge| {
-            entity_set.contains(edge.source_normalized_name.as_str())
-                && entity_set.contains(edge.target_normalized_name.as_str())
-        })
-        .map(|edge| edge.weight)
-        .sum();
+    let internal_relationships: f32 = relationships.iter().filter(|edge| {
+        entity_set.contains(edge.source_normalized_name.as_str())
+            && entity_set.contains(edge.target_normalized_name.as_str())
+    }).map(|edge: &EntityEdge| edge.weight).sum();
 
-    let entity_count = entity_ids.len() as f32;
-    let density = internal_relationships / entity_count.max(1.0);
+    let entity_count: f32 = entity_ids.len() as f32;
+    let density: f32 = internal_relationships / entity_count.max(1.0);
 
     (entity_count.sqrt() * density).min(10.0)
 }

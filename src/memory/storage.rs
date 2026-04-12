@@ -387,8 +387,8 @@ impl MemoryStorage for PostgresMemoryStorage {
     async fn get_memories_by_scope(
         &self,
         scope: MemoryScope,
-        user_id: Option<&str>,
-        session_id: Option<&str>,
+        _user_id: Option<&str>,
+        _session_id: Option<&str>,
         limit: usize,
     ) -> MemoryResult<Vec<MemoryEntry>> {
         let query = MemoryQuery::new()
@@ -522,9 +522,12 @@ fn row_to_memory_entry(row: sqlx::postgres::PgRow) -> MemoryResult<MemoryEntry> 
     };
 
     let metadata_json: serde_json::Value = row.try_get("metadata")?;
-    let metadata: crate::memory::types::MemoryMetadata = 
+    let mut metadata: crate::memory::types::MemoryMetadata = 
         serde_json::from_value(metadata_json)
             .map_err(|e| MemoryStorageError::Database(sqlx::Error::Decode(Box::new(e))))?;
+    
+    // Use entry_type from the database column (authoritative) instead of metadata
+    metadata.entry_type = entry_type;
 
     Ok(MemoryEntry {
         id,
@@ -543,8 +546,7 @@ fn row_to_memory_entry(row: sqlx::postgres::PgRow) -> MemoryResult<MemoryEntry> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::memory::types::{MemoryEntry, MemoryScope, MemoryType};
+    use crate::memory::types::{MemoryScope, MemoryType};
 
     // Note: These tests require a database connection
     // They are marked as integration tests

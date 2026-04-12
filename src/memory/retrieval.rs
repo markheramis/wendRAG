@@ -250,7 +250,7 @@ pub struct ScoredMemory {
  */
 pub async fn build_memory_context<S: MemoryStorage>(
     session_buffer: Option<&SessionBuffer>,
-    storage: Arc<S>,
+    _storage: Arc<S>,
     query: &str,
     user_id: Option<&str>,
     retriever: &MemoryRetriever<S>,
