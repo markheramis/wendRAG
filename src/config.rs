@@ -73,6 +73,11 @@ pub struct Config {
     pub chunking_filter_garbage: bool,
     /// Optional reranking stage applied after retrieval fusion.
     pub reranker: RerankerConfig,
+    /// Query routing configuration for automatic retrieval strategy selection.
+    /// Routes queries to local (chunk-level) vs global (community-level) retrieval.
+    pub query_routing: QueryRoutingConfig,
+    /// Memory subsystem configuration for agent-oriented session persistence.
+    pub memory: MemoryConfig,
     pub pool: PoolConfig,
 }
 
@@ -93,6 +98,39 @@ impl Default for PoolConfig {
         Self {
             max_connections: DEFAULT_POOL_MAX_CONNECTIONS,
             acquire_timeout: Duration::from_secs(DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS),
+        }
+    }
+}
+
+/**
+ * Query routing configuration for automatic retrieval strategy selection.
+ * 
+ * Routes queries to appropriate retrieval modes based on query characteristics:
+ * - Local queries: chunk-level + entity graph
+ * - Global queries: community-level + broader context
+ */
+#[derive(Debug, Clone, Copy)]
+pub struct QueryRoutingConfig {
+    /// Threshold for high-confidence classification (skip LLM fallback).
+    pub high_confidence_threshold: f32,
+    /// Threshold for using hybrid approach vs picking one strategy.
+    pub hybrid_threshold: f32,
+    /// Whether to enable LLM-based classification for edge cases.
+    pub enable_llm_fallback: bool,
+    /// Minimum query length to consider for classification.
+    pub min_query_length: usize,
+    /// Maximum query length before truncating for classification.
+    pub max_query_length: usize,
+}
+
+impl Default for QueryRoutingConfig {
+    fn default() -> Self {
+        Self {
+            high_confidence_threshold: 0.8,
+            hybrid_threshold: 0.6,
+            enable_llm_fallback: false,
+            min_query_length: 3,
+            max_query_length: 1000,
         }
     }
 }
@@ -411,6 +449,8 @@ impl Config {
                 model: reranker_model,
                 top_n: reranker_top_n,
             },
+            query_routing: QueryRoutingConfig::default(),
+            memory: MemoryConfig::default(),
             pool: PoolConfig {
                 max_connections: pool_max_connections,
                 acquire_timeout: Duration::from_secs(pool_acquire_timeout_secs),

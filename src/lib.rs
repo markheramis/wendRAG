@@ -3,6 +3,7 @@ pub mod config_file;
 pub mod embed;
 pub mod entity;
 pub mod ingest;
+pub mod memory;
 pub mod mcp;
 pub mod observability;
 pub mod rerank;
