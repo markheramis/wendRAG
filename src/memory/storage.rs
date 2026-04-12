@@ -7,7 +7,7 @@
 
 use crate::memory::types::{MemoryEntry, MemoryQuery, MemoryScope, MemoryType};
 use async_trait::async_trait;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /**
