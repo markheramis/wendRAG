@@ -20,13 +20,14 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::config::ChunkingStrategy;
+use crate::config::{ChunkingStrategy, CommunityConfig};
 use crate::embed::EmbeddingProvider;
 use crate::entity::{EntityExtractor, GraphSettings};
 use crate::ingest::pipeline;
 use crate::ingest::pipeline::{ContentIngestRequest, DirectoryIngestRequest, IngestOptions};
 use crate::ingest::reader::detect_file_type;
 use crate::rerank::RerankerProvider;
+use crate::retrieve::router::{QueryRouter, QueryRouterConfig, QueryScope};
 use crate::retrieve::{ScoredChunk, SearchMode};
 use crate::retrieve::{dense, hybrid, sparse};
 use crate::store::{SearchFilters, StorageBackend};
@@ -40,6 +41,7 @@ const MAX_CONCURRENT_BATCH_INGESTS: usize = 4;
 pub(super) const STATUS_RESOURCE_URI: &str = "rag://status";
 pub(super) const DOCUMENTS_RESOURCE_URI: &str = "rag://documents";
 pub(super) const CONFIG_RESOURCE_URI: &str = "rag://config";
+pub(super) const COMMUNITIES_RESOURCE_URI: &str = "rag://communities";
 pub(super) const DOCUMENT_DETAIL_URI_TEMPLATE: &str = "rag://documents/{id}";
 pub(super) const DOCUMENT_DETAIL_URI_PREFIX: &str = "rag://documents/";
 
@@ -69,14 +71,13 @@ pub struct WendRagServer {
     pub(super) embedder: Arc<dyn EmbeddingProvider>,
     entity_extractor: Option<Arc<dyn EntityExtractor>>,
     reranker: Option<Arc<dyn RerankerProvider>>,
-    /// Number of candidates to pass to the reranker before trimming.
     reranker_top_n: usize,
     graph_settings: GraphSettings,
+    query_router: Arc<QueryRouter>,
+    community_config: CommunityConfig,
     chunking_strategy: ChunkingStrategy,
     semantic_threshold: f64,
-    /// Maximum sentences per chunk for semantic chunking.
     chunking_max_sentences: usize,
-    /// Enables pre-filtering of garbage/boilerplate content.
     chunking_filter_garbage: bool,
     pub(super) server_config: ServerConfig,
     tool_router: ToolRouter<Self>,
@@ -99,6 +100,7 @@ impl WendRagServer {
         reranker: Option<Arc<dyn RerankerProvider>>,
         reranker_top_n: usize,
         graph_settings: GraphSettings,
+        community_config: CommunityConfig,
         chunking_strategy: ChunkingStrategy,
         semantic_threshold: f64,
         chunking_max_sentences: usize,
@@ -112,6 +114,8 @@ impl WendRagServer {
             reranker,
             reranker_top_n,
             graph_settings,
+            query_router: Arc::new(QueryRouter::new(QueryRouterConfig::default())),
+            community_config,
             chunking_strategy,
             semantic_threshold,
             chunking_max_sentences,
@@ -137,12 +141,21 @@ impl WendRagServer {
         &self,
         input: &SearchInput,
     ) -> Result<(SearchMode, Vec<ScoredChunk>), String> {
-        let mode = input
-            .mode
-            .as_deref()
-            .map(SearchMode::from_str_loose)
-            .unwrap_or(SearchMode::Hybrid);
+        let explicit_mode = input.mode.as_deref().map(SearchMode::from_str_loose);
+        let mode = explicit_mode.unwrap_or(SearchMode::Hybrid);
         let requested_top_k = input.top_k.unwrap_or(10) as usize;
+
+        if explicit_mode.is_none() && self.graph_settings.enabled {
+            let classification = self.query_router.classify(&input.query);
+            tracing::debug!(
+                scope = ?classification.scope,
+                confidence = classification.confidence.score,
+                "query router classification"
+            );
+            if classification.scope == QueryScope::Local {
+                tracing::debug!("local query detected, community branch will be skipped by graph settings");
+            }
+        }
 
         // Over-fetch when reranking is enabled so the reranker has enough
         // candidates to choose from.
@@ -323,6 +336,7 @@ impl WendRagServer {
                     project,
                     &tags,
                     self.entity_extractor.as_ref(),
+                    Some(self.community_config.clone()),
                     self.chunking_strategy,
                     self.semantic_threshold,
                     self.chunking_max_sentences,
@@ -385,6 +399,7 @@ impl WendRagServer {
                 project,
                 &tags,
                 self.entity_extractor.as_ref(),
+                Some(self.community_config.clone()),
                 self.chunking_strategy,
                 self.semantic_threshold,
                 self.chunking_max_sentences,
@@ -437,6 +452,7 @@ impl WendRagServer {
             let storage = self.storage.clone();
             let embedder = self.embedder.clone();
             let entity_extractor = self.entity_extractor.clone();
+            let community_config = self.community_config.clone();
             let tags = tags.clone();
             let project = project.clone();
             let chunking_strategy = self.chunking_strategy;
@@ -459,6 +475,7 @@ impl WendRagServer {
                         project.as_deref(),
                         &tags,
                         entity_extractor.as_ref(),
+                        Some(community_config.clone()),
                         chunking_strategy,
                         semantic_threshold,
                         chunking_max_sentences,
@@ -691,6 +708,15 @@ impl ServerHandler for WendRagServer {
                     .with_mime_type("application/json"),
                 None,
             ),
+            Annotated::new(
+                RawResource::new(COMMUNITIES_RESOURCE_URI, "communities")
+                    .with_title("Entity Communities")
+                    .with_description(
+                        "Detected entity communities with summaries and importance scores.",
+                    )
+                    .with_mime_type("application/json"),
+                None,
+            ),
         ]))
     }
 
@@ -722,6 +748,7 @@ impl ServerHandler for WendRagServer {
             STATUS_RESOURCE_URI => self.resource_status().await,
             DOCUMENTS_RESOURCE_URI => self.resource_documents().await,
             CONFIG_RESOURCE_URI => self.resource_config(),
+            COMMUNITIES_RESOURCE_URI => self.resource_communities().await,
             uri if uri.starts_with(DOCUMENT_DETAIL_URI_PREFIX) => {
                 let id = uri[DOCUMENT_DETAIL_URI_PREFIX.len()..].to_owned();
                 self.resource_document_detail(&id).await
@@ -793,6 +820,7 @@ mod tests {
             None,
             30,
             GraphSettings::new(false, 2),
+            CommunityConfig::default(),
             crate::config::ChunkingStrategy::Fixed,
             0.25,
             20,

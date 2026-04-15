@@ -3,6 +3,7 @@
  * implementation that delegates to focused submodules.
  */
 
+mod community;
 mod embeddings;
 mod entity_graph;
 mod filters;
@@ -18,9 +19,9 @@ use sqlx::sqlite::Sqlite;
 use sqlx::{QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
-use crate::entity::DocumentEntityGraph;
+use crate::entity::{CommunityWithSummary, DocumentEntityGraph};
 use crate::retrieve::ScoredChunk;
-use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount};
+use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount, StoredCommunity};
 
 use crate::config::PoolConfig;
 
@@ -595,5 +596,42 @@ impl StorageBackend for SqliteBackend {
         tx.commit().await?;
 
         Ok(Some((path, chunk_count)))
+    }
+
+    async fn save_communities(
+        &self,
+        project: Option<&str>,
+        communities: &[CommunityWithSummary],
+    ) -> Result<(), sqlx::Error> {
+        community::save_communities(&self.pool, project, communities).await
+    }
+
+    async fn delete_project_communities(&self, project: Option<&str>) -> Result<(), sqlx::Error> {
+        community::delete_project_communities(&self.pool, project).await
+    }
+
+    async fn get_communities_for_entities(
+        &self,
+        project: Option<&str>,
+        entity_ids: &[Uuid],
+    ) -> Result<Vec<StoredCommunity>, sqlx::Error> {
+        community::get_communities_for_entities(&self.pool, project, entity_ids).await
+    }
+
+    async fn search_communities_by_embedding(
+        &self,
+        project: Option<&str>,
+        query_embedding: &[f32],
+        top_k: i64,
+    ) -> Result<Vec<StoredCommunity>, sqlx::Error> {
+        community::search_communities_by_embedding(&self.pool, project, query_embedding, top_k)
+            .await
+    }
+
+    async fn list_communities(
+        &self,
+        project: Option<&str>,
+    ) -> Result<Vec<StoredCommunity>, sqlx::Error> {
+        community::list_communities(&self.pool, project).await
     }
 }

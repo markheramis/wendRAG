@@ -180,6 +180,7 @@ fn build_server(
         reranker,
         cfg.reranker.top_n,
         cfg.graph_settings,
+        cfg.community.clone(),
         cfg.chunking_strategy,
         cfg.chunking_semantic_threshold,
         cfg.chunking_max_sentences,

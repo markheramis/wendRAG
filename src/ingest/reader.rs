@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
-use super::url::read_url_document;
+use super::url::read_url_document_with_options;
 
 pub const URL_FILE_TYPE: &str = "url";
 
@@ -167,11 +167,23 @@ pub async fn read_source(
     path: &str,
     base_dir: Option<&Path>,
 ) -> Result<ReadDocument, ReadError> {
+    read_source_with_options(path, base_dir, true).await
+}
+
+/**
+ * Reads a source with configurable SSRF protection for URL ingestion.
+ * Integration tests pass `enforce_ssrf = false` to reach local test servers.
+ */
+pub async fn read_source_with_options(
+    path: &str,
+    base_dir: Option<&Path>,
+    enforce_ssrf: bool,
+) -> Result<ReadDocument, ReadError> {
     let file_type =
         detect_file_type(path).ok_or_else(|| ReadError::UnsupportedType(path.to_string()))?;
 
     if file_type == URL_FILE_TYPE {
-        return read_url_document(path).await;
+        return read_url_document_with_options(path, enforce_ssrf).await;
     }
 
     // SECURITY: Validate path to prevent directory traversal

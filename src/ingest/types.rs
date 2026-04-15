@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::config::ChunkingStrategy;
+use crate::config::{ChunkingStrategy, CommunityConfig};
 use crate::entity::{EntityExtractionError, EntityExtractor, EntityGraphBuildError};
 
 #[derive(Debug, thiserror::Error)]
@@ -78,10 +78,15 @@ pub struct IngestOptions {
     pub project: Option<String>,
     pub tags: Vec<String>,
     pub entity_extractor: Option<Arc<dyn EntityExtractor>>,
+    pub community_config: Option<CommunityConfig>,
     pub chunking_strategy: ChunkingStrategy,
     pub semantic_threshold: f64,
     pub max_sentences: usize,
     pub filter_garbage: bool,
+    /// Enables SSRF protection for URL ingestion (blocks private/loopback IPs).
+    /// Defaults to `true`; integration tests set this to `false` to reach
+    /// local test servers.
+    pub enforce_ssrf: bool,
 }
 
 impl IngestOptions {
@@ -93,6 +98,7 @@ impl IngestOptions {
         project: Option<&str>,
         tags: &[String],
         entity_extractor: Option<&Arc<dyn EntityExtractor>>,
+        community_config: Option<CommunityConfig>,
         chunking_strategy: ChunkingStrategy,
         semantic_threshold: f64,
         max_sentences: usize,
@@ -102,10 +108,12 @@ impl IngestOptions {
             project: project.map(ToOwned::to_owned),
             tags: tags.to_vec(),
             entity_extractor: entity_extractor.cloned(),
+            community_config,
             chunking_strategy,
             semantic_threshold,
             max_sentences,
             filter_garbage,
+            enforce_ssrf: true,
         }
     }
 }

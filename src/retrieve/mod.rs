@@ -1,6 +1,8 @@
+pub mod community;
 pub mod dense;
 pub mod fusion;
 pub mod hybrid;
+pub mod router;
 pub mod sparse;
 
 use uuid::Uuid;

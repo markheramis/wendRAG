@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::config::CommunityConfig;
 use crate::embed::EmbeddingProvider;
 use crate::embed::provider::EmbeddingError;
 
@@ -24,12 +25,12 @@ use super::model::{DocumentEntityGraph, EntityEdge, EntityNode};
 
 /// Minimum number of entities required to trigger community detection.
 /// Below this threshold, all entities are treated as one community.
-const MIN_ENTITIES_FOR_COMMUNITIES: usize = 5;
+pub const MIN_ENTITIES_FOR_COMMUNITIES: usize = 5;
 
-/// Batch size for LLM summary generation (to minimize API calls).
+/// Batch size for summary generation (to minimize API calls).
 const SUMMARY_BATCH_SIZE: usize = 10;
 
-/// Community data with optional LLM-generated summary.
+/// Community data with optional summary and its embedding.
 #[derive(Debug, Clone)]
 pub struct CommunityWithSummary {
     pub community: EntityCommunity,
@@ -37,16 +38,28 @@ pub struct CommunityWithSummary {
     pub summary_embedding: Option<Vec<f32>>,
 }
 
-/// Manages community detection and summary generation for entity graphs.
+/**
+ * Manages community detection, summary generation, and two-tier retrieval
+ * for entity graphs. Summaries default to synthetic (fast, deterministic);
+ * set `CommunityConfig.llm_summaries_enabled` for LLM-generated summaries.
+ */
 pub struct CommunityManager {
-    config: CommunityDetectionConfig,
+    detection_config: CommunityDetectionConfig,
+    community_config: CommunityConfig,
     embedder: Arc<dyn EmbeddingProvider>,
 }
 
 impl CommunityManager {
-    /// Creates a new community manager with the specified configuration.
-    pub fn new(config: CommunityDetectionConfig, embedder: Arc<dyn EmbeddingProvider>) -> Self {
-        Self { config, embedder }
+    pub fn new(
+        detection_config: CommunityDetectionConfig,
+        community_config: CommunityConfig,
+        embedder: Arc<dyn EmbeddingProvider>,
+    ) -> Self {
+        Self {
+            detection_config,
+            community_config,
+            embedder,
+        }
     }
 
     /**
@@ -66,8 +79,11 @@ impl CommunityManager {
             return Ok(vec![self.create_single_community(graph).await?]);
         }
 
-        // Detect communities using optimized algorithm
-        let communities = detect_communities(&graph.entities, &graph.relationships, &self.config);
+        let communities = detect_communities(
+            &graph.entities,
+            &graph.relationships,
+            &self.detection_config,
+        );
 
         // Generate summaries in batches for efficiency
         let communities_with_summaries = self
@@ -157,23 +173,21 @@ impl CommunityManager {
 
     /**
      * Generates a summary and embedding for a single community.
-     * 
-     * For performance, this creates a synthetic summary from entity names
-     * rather than calling an LLM, avoiding latency and API costs.
-     * The summary captures the key themes of the community.
+     *
+     * Uses synthetic summaries by default (fast, deterministic). When LLM
+     * summaries are enabled, calls the configured endpoint with automatic
+     * fallback to synthetic on any error.
      */
     async fn generate_summary(
         &self,
         community: &EntityCommunity,
         all_entities: &[EntityNode],
     ) -> Result<(Option<String>, Option<Vec<f32>>), CommunityManagerError> {
-        // Build entity lookup
         let entity_map: HashMap<&str, &EntityNode> = all_entities
             .iter()
             .map(|e| (e.normalized_name.as_str(), e))
             .collect();
 
-        // Collect entity information for summary
         let mut entity_descriptions = Vec::new();
         let mut entity_types: HashSet<&str> = HashSet::new();
 
@@ -193,98 +207,131 @@ impl CommunityManager {
             return Ok((None, None));
         }
 
-        // Generate synthetic summary (fast, no LLM call needed)
-        let summary = self.create_synthetic_summary(&community.name, &entity_descriptions, &entity_types);
+        let summary = if self.community_config.llm_summaries_enabled {
+            match self.generate_llm_summary(&entity_descriptions).await {
+                Ok(llm_summary) => llm_summary,
+                Err(e) => {
+                    tracing::warn!(error = %e, "LLM summary failed, falling back to synthetic");
+                    create_synthetic_summary(&community.name, &entity_descriptions, &entity_types)
+                }
+            }
+        } else {
+            create_synthetic_summary(&community.name, &entity_descriptions, &entity_types)
+        };
 
-        // Generate embedding for the summary
-        let embedding = self.embedder.embed(&[summary.clone()]).await.map_err(|e| CommunityManagerError::Embedding(e))?;
-        
-        Ok((Some(summary), Some(embedding.into_iter().next().unwrap_or_default())))
+        let embedding = self
+            .embedder
+            .embed(&[summary.clone()])
+            .await
+            .map_err(CommunityManagerError::Embedding)?;
+
+        Ok((
+            Some(summary),
+            Some(embedding.into_iter().next().unwrap_or_default()),
+        ))
     }
 
     /**
-     * Creates a synthetic summary from entity information.
-     * This is fast and doesn't require LLM calls.
+     * Calls an OpenAI-compatible chat endpoint to produce a community summary.
+     * Keeps the prompt minimal to reduce token usage.
      */
-    fn create_synthetic_summary(
+    async fn generate_llm_summary(
         &self,
-        community_name: &str,
         entity_descriptions: &[String],
-        entity_types: &HashSet<&str>,
-    ) -> String {
-        let types_str: Vec<_> = entity_types.iter().map(|&t| t.to_string()).collect();
-        
-        let summary = format!(
-            "Community: {}. Contains {} entities of types: {}. Key members: {}",
-            community_name,
-            entity_descriptions.len(),
-            types_str.join(", "),
-            entity_descriptions[..entity_descriptions.len().min(5)].join("; ")
+    ) -> Result<String, CommunityManagerError> {
+        let entity_list = entity_descriptions[..entity_descriptions.len().min(10)].join("\n- ");
+        let prompt = format!(
+            "Summarize this group of related entities in 2-3 sentences:\n- {entity_list}"
         );
 
-        summary
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "model": self.community_config.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200,
+            "temperature": 0.3,
+        });
+
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.community_config.llm_base_url.trim_end_matches('/')
+        );
+
+        let response = client
+            .post(&url)
+            .bearer_auth(&self.community_config.llm_api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CommunityManagerError::LlmRequest(e.to_string()))?;
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| CommunityManagerError::LlmRequest(e.to_string()))?;
+
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| CommunityManagerError::LlmRequest("no content in response".into()))
     }
 
     /**
-     * Performs two-tier retrieval:
-     * - Local: Returns chunks from entities in the same community as seed entities
-     * - Global: Returns communities matching the query embedding for broad exploration
+     * Performs two-tier retrieval using in-memory community data:
+     * - Local: communities containing seed entities
+     * - Global: communities ranked by query embedding similarity
      */
-    pub async fn two_tier_retrieve(
+    pub fn two_tier_retrieve(
         &self,
         communities: &[CommunityWithSummary],
         query_embedding: &[f32],
         seed_entity_names: &[String],
         top_k_communities: usize,
     ) -> TwoTierRetrievalResult {
-        // Local tier: Find communities containing seed entities
-        let local_communities: Vec<_> = communities.iter().filter(|c| {
+        let local_communities: Vec<_> = communities
+            .iter()
+            .filter(|c| {
                 c.community
                     .entity_ids
                     .iter()
                     .any(|e| seed_entity_names.contains(e))
-        }).cloned().collect();
+            })
+            .cloned()
+            .collect();
 
-        // Global tier: Find communities matching query embedding
-        let global_communities: Vec<CommunityWithSummary> = self.rank_communities_by_embedding(communities, query_embedding, top_k_communities);
+        let global_communities =
+            rank_communities_by_embedding(communities, query_embedding, top_k_communities);
 
         TwoTierRetrievalResult {
             local: local_communities,
             global: global_communities,
         }
     }
+}
 
-    /**
-     * Ranks communities by similarity to query embedding.
-     * Returns top-k communities for global exploration.
-     */
-    fn rank_communities_by_embedding(
-        &self,
-        communities: &[CommunityWithSummary],
-        query_embedding: &[f32],
-        top_k: usize,
-    ) -> Vec<CommunityWithSummary> {
-        let mut scored: Vec<(f32, CommunityWithSummary)> = communities.iter().filter_map(|c| {
-            c.summary_embedding.as_ref().map(|emb| {
-                let similarity = cosine_similarity(query_embedding, emb);
-                (similarity, c.clone())
-            })
-        }).collect();
-
-        // Sort by similarity descending
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Return top-k
-        scored.into_iter().take(top_k).map(|(_, c)| c).collect()
-    }
+/**
+ * Creates a synthetic summary from entity metadata. Deterministic and fast
+ * with zero API calls.
+ */
+fn create_synthetic_summary(
+    community_name: &str,
+    entity_descriptions: &[String],
+    entity_types: &HashSet<&str>,
+) -> String {
+    let types_str: Vec<_> = entity_types.iter().map(|&t| t.to_string()).collect();
+    format!(
+        "Community: {}. Contains {} entities of types: {}. Key members: {}",
+        community_name,
+        entity_descriptions.len(),
+        types_str.join(", "),
+        entity_descriptions[..entity_descriptions.len().min(5)].join("; ")
+    )
 }
 
 /// Result of two-tier retrieval.
 #[derive(Debug, Clone)]
 pub struct TwoTierRetrievalResult {
-    /// Communities containing seed entities (for local context).
     pub local: Vec<CommunityWithSummary>,
-    /// Communities matching query (for global exploration).
     pub global: Vec<CommunityWithSummary>,
 }
 
@@ -294,22 +341,39 @@ pub enum CommunityManagerError {
     Embedding(#[from] EmbeddingError),
     #[error("no entities in community")]
     EmptyCommunity,
+    #[error("LLM request failed: {0}")]
+    LlmRequest(String),
 }
 
-/// Calculate cosine similarity between two vectors.
+fn rank_communities_by_embedding(
+    communities: &[CommunityWithSummary],
+    query_embedding: &[f32],
+    top_k: usize,
+) -> Vec<CommunityWithSummary> {
+    let mut scored: Vec<(f32, CommunityWithSummary)> = communities
+        .iter()
+        .filter_map(|c| {
+            c.summary_embedding.as_ref().map(|emb| {
+                let similarity = cosine_similarity(query_embedding, emb);
+                (similarity, c.clone())
+            })
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(top_k).map(|(_, c)| c).collect()
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || b.is_empty() || a.len() != b.len() {
         return 0.0;
     }
-
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
-
     dot / (norm_a * norm_b)
 }
 
@@ -354,11 +418,18 @@ mod tests {
         }
     }
 
+    fn test_manager() -> CommunityManager {
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
+        CommunityManager::new(
+            CommunityDetectionConfig::default(),
+            CommunityConfig::default(),
+            embedder,
+        )
+    }
+
     #[tokio::test]
     async fn test_small_graph_single_community() {
-        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
-        let manager = CommunityManager::new(CommunityDetectionConfig::default(), embedder);
-
+        let manager = test_manager();
         let graph = DocumentEntityGraph {
             entities: vec![
                 EntityNode {
@@ -387,26 +458,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_tier_retrieval() {
-        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
-        let manager = CommunityManager::new(CommunityDetectionConfig::default(), embedder);
-
-        let communities = vec![
-            CommunityWithSummary {
-                community: EntityCommunity {
-                    id: uuid::Uuid::new_v4(),
-                    name: "Test Community".to_string(),
-                    entity_ids: vec!["alice".to_string(), "bob".to_string()],
-                    importance: 1.0,
-                },
-                summary: Some("Test summary".to_string()),
-                summary_embedding: Some(vec![1.0, 0.0, 0.0]),
+        let manager = test_manager();
+        let communities = vec![CommunityWithSummary {
+            community: EntityCommunity {
+                id: uuid::Uuid::new_v4(),
+                name: "Test Community".to_string(),
+                entity_ids: vec!["alice".to_string(), "bob".to_string()],
+                importance: 1.0,
             },
-        ];
+            summary: Some("Test summary".to_string()),
+            summary_embedding: Some(vec![1.0, 0.0, 0.0]),
+        }];
 
-        let result = manager
-            .two_tier_retrieve(&communities, &[1.0, 0.0, 0.0], &["alice".to_string()], 5)
-            .await;
-
+        let result =
+            manager.two_tier_retrieve(&communities, &[1.0, 0.0, 0.0], &["alice".to_string()], 5);
         assert!(!result.local.is_empty());
+    }
+
+    #[test]
+    fn test_synthetic_summary_format() {
+        let mut types = HashSet::new();
+        types.insert("PERSON");
+        types.insert("ORG");
+        let descs = vec!["Alice (PERSON): Engineer".into(), "Acme (ORG)".into()];
+        let summary = create_synthetic_summary("Test", &descs, &types);
+        assert!(summary.contains("Test"));
+        assert!(summary.contains("2 entities"));
+    }
+
+    #[test]
+    fn test_llm_config_defaults_to_synthetic() {
+        let config = CommunityConfig::default();
+        assert!(!config.llm_summaries_enabled);
     }
 }

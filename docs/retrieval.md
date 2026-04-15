@@ -33,6 +33,20 @@ When `GRAPH_RETRIEVAL_ENABLED=true`, hybrid search adds a third graph branch:
 
 Entity extraction must be enabled at ingestion time (`ENTITY_EXTRACTION_ENABLED=true`) for graph retrieval to have data to work with. See [configuration.md](configuration.md) for endpoint and model options.
 
+## Community-Augmented Retrieval
+
+When graph retrieval is enabled and entities have been extracted, wendRAG also detects **entity communities** using the Louvain algorithm. Communities group related entities that frequently co-occur, enabling two-tier retrieval:
+
+1. **Local tier** — communities containing entities from the initial search results are identified via the `community_members` table.
+2. **Global tier** — communities semantically similar to the query are found via ANN search over community summary embeddings.
+3. Entity IDs from matched communities are collected and used to fetch additional chunks, which are merged into the final RRF fusion as a fourth branch.
+
+Community detection runs automatically during ingestion when a document's entity graph contains 5 or more entities. Communities are scoped per project; global communities (no project) are included in all searches.
+
+Community summaries are generated synthetically by default (fast, deterministic). Set `WEND_RAG_COMMUNITY_LLM_SUMMARIES=true` to use LLM-generated summaries with automatic fallback to synthetic on API errors.
+
+The `rag://communities` MCP resource lists all detected communities. See [entity-communities.md](entity-communities.md) for the full architecture guide.
+
 ---
 
 ## Chunking

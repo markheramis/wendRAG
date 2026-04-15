@@ -14,7 +14,8 @@ pub use community::{
     CommunityDetectionConfig, EntityCommunity, detect_communities,
 };
 pub use community_manager::{
-    CommunityManager, CommunityManagerError, CommunityWithSummary, TwoTierRetrievalResult,
+    CommunityManager, CommunityManagerError, CommunityWithSummary,
+    MIN_ENTITIES_FOR_COMMUNITIES, TwoTierRetrievalResult,
 };
 pub use extractor::OpenAiCompatEntityExtractor;
 pub use graph_build::build_document_entity_graph;

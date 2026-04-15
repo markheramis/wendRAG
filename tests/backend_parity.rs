@@ -17,6 +17,7 @@ use wend_rag::entity::{
 use wend_rag::ingest::pipeline::{
     self, ContentIngestRequest, DirectoryIngestRequest, IngestOptions, IngestStatus,
 };
+use wend_rag::ingest::reader::read_source_with_options;
 use wend_rag::retrieve::{dense, fusion, hybrid, sparse};
 use wend_rag::store::{PostgresBackend, SearchFilters, SqliteBackend, StorageBackend};
 use sqlx::postgres::PgPoolOptions;
@@ -162,6 +163,7 @@ async fn backends_match_ingest_and_search_behaviour() -> TestResult<()> {
                 Some(&harness.project),
                 &alpha_tags,
                 None,
+                None,
                 ChunkingStrategy::Fixed,
                 0.25,
                 20,
@@ -193,6 +195,7 @@ async fn backends_match_ingest_and_search_behaviour() -> TestResult<()> {
                 Some(&harness.project),
                 &alpha_tags,
                 None,
+                None,
                 ChunkingStrategy::Fixed,
                 0.25,
                 20,
@@ -218,6 +221,7 @@ async fn backends_match_ingest_and_search_behaviour() -> TestResult<()> {
             &IngestOptions::new(
                 Some(&harness.project),
                 &beta_tags,
+                None,
                 None,
                 ChunkingStrategy::Fixed,
                 0.25,
@@ -354,6 +358,7 @@ async fn graph_retrieval_works_on_all_backends() -> TestResult<()> {
                 Some(&harness.project),
                 &no_tags,
                 Some(&extractor),
+                None,
                 ChunkingStrategy::Fixed,
                 0.25,
                 20,
@@ -374,6 +379,7 @@ async fn graph_retrieval_works_on_all_backends() -> TestResult<()> {
                 Some(&harness.project),
                 &no_tags,
                 Some(&extractor),
+                None,
                 ChunkingStrategy::Fixed,
                 0.25,
                 20,
@@ -467,10 +473,11 @@ async fn backends_return_ordered_document_chunks_for_full_context() -> TestResul
                 Some(&harness.project),
                 &no_tags,
                 None,
+                None,
                 ChunkingStrategy::Fixed,
                 0.25,
                 20,
-                false, // disable garbage filtering for this test
+                false,
             ),
         )
         .await?;
@@ -526,30 +533,34 @@ async fn url_ingestion_works_on_all_backends() -> TestResult<()> {
     )
     .await?;
     let article_url = server.article_url();
+    let url_doc = read_source_with_options(&article_url, None, false).await?;
 
     for harness in available_backends().await? {
-        let output = pipeline::ingest_path(
+        let result = pipeline::ingest_content(
             &harness.storage,
             &embedder,
-            None,
-            &article_url,
-            Some(&harness.project),
-            &no_tags,
-            ChunkingStrategy::Fixed,
-            0.25,
-            20,
-            true,
+            ContentIngestRequest {
+                file_path: &article_url,
+                file_name: &url_doc.file_name,
+                file_type: url_doc.file_type,
+                text: &url_doc.text,
+            },
+            &IngestOptions::new(
+                Some(&harness.project),
+                &no_tags,
+                None,
+                None,
+                ChunkingStrategy::Fixed,
+                0.25,
+                20,
+                true,
+            ),
         )
         .await?;
 
-        assert_eq!(
-            output.added, 1,
+        assert!(
+            matches!(result.status, IngestStatus::Created),
             "{} backend should ingest the URL document",
-            harness.name
-        );
-        assert_eq!(
-            output.failed, 0,
-            "{} backend should not fail URL ingestion",
             harness.name
         );
 
@@ -601,8 +612,6 @@ async fn url_ingestion_works_on_all_backends() -> TestResult<()> {
  */
 #[tokio::test]
 async fn url_ingestion_respects_robots_txt() -> TestResult<()> {
-    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
-    let no_tags: Vec<String> = Vec::new();
     let server = UrlTestServer::start(
         "User-agent: *\nDisallow: /article\n",
         r#"<html><body><article><p>Blocked content</p></article></body></html>"#,
@@ -610,28 +619,17 @@ async fn url_ingestion_respects_robots_txt() -> TestResult<()> {
     .await?;
     let article_url = server.article_url();
 
-    for harness in available_backends().await? {
-        let error = pipeline::ingest_path(
-            &harness.storage,
-            &embedder,
-            None,
-            &article_url,
-            Some(&harness.project),
-            &no_tags,
-            ChunkingStrategy::Fixed,
-            0.25,
-            20,
-            true,
-        )
+    let read_error = read_source_with_options(&article_url, None, false)
         .await
         .expect_err("robots.txt should block URL ingestion");
 
-        assert!(
-            error.to_string().contains("robots.txt disallows"),
-            "{} backend should surface the robots.txt denial",
-            harness.name
-        );
+    assert!(
+        read_error.to_string().contains("robots.txt disallows"),
+        "should surface the robots.txt denial, got: {}",
+        read_error
+    );
 
+    for harness in available_backends().await? {
         let listed_docs = harness
             .storage
             .list_documents(Some(&harness.project), None)
@@ -848,6 +846,7 @@ async fn run_incremental_sync_test(harness: &BackendHarness) -> TestResult<()> {
     let options = IngestOptions::new(
         Some(&harness.project),
         &[],
+        None,
         None,
         ChunkingStrategy::Fixed,
         0.25,

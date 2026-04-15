@@ -10,12 +10,15 @@ use sha2::{Digest, Sha256};
 
 use crate::config::ChunkingStrategy;
 use crate::embed::EmbeddingProvider;
-use crate::entity::{EntityExtractionInput, EntityExtractor, build_document_entity_graph};
+use crate::entity::{
+    CommunityDetectionConfig, CommunityManager, EntityExtractionInput, EntityExtractor,
+    MIN_ENTITIES_FOR_COMMUNITIES, build_document_entity_graph,
+};
 use crate::store::{ChunkInsert, DocumentUpsert, StorageBackend};
 
 use super::chunker::{RawChunk, chunk_document};
 use super::directory::ingest_single_path;
-use super::reader::{detect_file_type, read_source};
+use super::reader::{detect_file_type, read_source_with_options};
 
 pub use super::directory::ingest_directory;
 pub use super::types::{
@@ -43,6 +46,7 @@ pub async fn ingest_path(
         project,
         tags,
         entity_extractor,
+        None,
         chunking_strategy,
         semantic_threshold,
         max_sentences,
@@ -92,11 +96,15 @@ pub async fn ingest_file(
     max_sentences: usize,
     filter_garbage: bool,
 ) -> Result<IngestResult, IngestError> {
-    let source = read_source(file_path, None).await?;
+    let base_dir = std::path::Path::new(file_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+    let source = read_source_with_options(file_path, base_dir, true).await?;
     let options = IngestOptions::new(
         project,
         tags,
         entity_extractor,
+        None,
         chunking_strategy,
         semantic_threshold,
         max_sentences,
@@ -211,6 +219,32 @@ pub async fn ingest_content(
         storage
             .replace_document_entity_graph(doc_id, document_graph)
             .await?;
+
+        if document_graph.entities.len() >= MIN_ENTITIES_FOR_COMMUNITIES {
+            let community_config = options
+                .community_config
+                .clone()
+                .unwrap_or_default();
+            let manager = CommunityManager::new(
+                CommunityDetectionConfig::default(),
+                community_config,
+                embedder.clone(),
+            );
+            match manager.analyze_graph(document_graph).await {
+                Ok(communities) => {
+                    let project = options.project.as_deref();
+                    if let Err(e) = storage.delete_project_communities(project).await {
+                        tracing::warn!(error = %e, "failed to clear old communities");
+                    }
+                    if let Err(e) = storage.save_communities(project, &communities).await {
+                        tracing::warn!(error = %e, "failed to persist communities");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "community detection failed, skipping");
+                }
+            }
+        }
     }
 
     let was_update = storage

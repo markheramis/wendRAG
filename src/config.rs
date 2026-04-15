@@ -75,6 +75,8 @@ pub struct Config {
     /// Query routing configuration for automatic retrieval strategy selection.
     /// Routes queries to local (chunk-level) vs global (community-level) retrieval.
     pub query_routing: QueryRoutingConfig,
+    /// Community detection and summary generation settings.
+    pub community: CommunityConfig,
     /// Memory subsystem configuration for agent-oriented session persistence.
     pub memory: MemoryConfig,
     pub pool: PoolConfig,
@@ -130,6 +132,32 @@ impl Default for QueryRoutingConfig {
             enable_llm_fallback: false,
             min_query_length: 3,
             max_query_length: 1000,
+        }
+    }
+}
+
+/**
+ * Community detection and summary generation configuration.
+ *
+ * Summaries default to synthetic (fast, deterministic). When LLM summaries
+ * are enabled, the configured endpoint generates richer community descriptions
+ * with automatic fallback to synthetic on API errors.
+ */
+#[derive(Debug, Clone)]
+pub struct CommunityConfig {
+    pub llm_summaries_enabled: bool,
+    pub llm_base_url: String,
+    pub llm_model: String,
+    pub llm_api_key: String,
+}
+
+impl Default for CommunityConfig {
+    fn default() -> Self {
+        Self {
+            llm_summaries_enabled: false,
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            llm_api_key: String::new(),
         }
     }
 }
@@ -420,6 +448,31 @@ impl Config {
             })
             .unwrap_or(DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS);
 
+        let community_llm_enabled_str = yaml_or_env(
+            "WEND_RAG_COMMUNITY_LLM_SUMMARIES",
+            fc.community.llm_summaries.map(|b| b.to_string()),
+        );
+        let community_llm_enabled =
+            parse_loose_bool(community_llm_enabled_str.as_deref(), false);
+
+        let community_llm_base_url = yaml_or_env(
+            "WEND_RAG_COMMUNITY_LLM_URL",
+            fc.community.base_url.clone(),
+        )
+        .unwrap_or_else(|| entity_extraction_base_url.clone());
+
+        let community_llm_model = yaml_or_env(
+            "WEND_RAG_COMMUNITY_LLM_MODEL",
+            fc.community.model.clone(),
+        )
+        .unwrap_or_else(|| entity_extraction_model.clone());
+
+        let community_llm_api_key = yaml_or_env(
+            "WEND_RAG_COMMUNITY_LLM_API_KEY",
+            fc.community.api_key.clone(),
+        )
+        .unwrap_or_else(|| entity_extraction_api_key.clone());
+
         Ok(Config {
             host,
             port,
@@ -449,6 +502,12 @@ impl Config {
                 top_n: reranker_top_n,
             },
             query_routing: QueryRoutingConfig::default(),
+            community: CommunityConfig {
+                llm_summaries_enabled: community_llm_enabled,
+                llm_base_url: community_llm_base_url,
+                llm_model: community_llm_model,
+                llm_api_key: community_llm_api_key,
+            },
             memory: MemoryConfig::default(),
             pool: PoolConfig {
                 max_connections: pool_max_connections,

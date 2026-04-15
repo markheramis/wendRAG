@@ -8,7 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use uuid::Uuid;
 
 use crate::config::{Config, PoolConfig, StorageBackendKind};
-use crate::entity::DocumentEntityGraph;
+use crate::entity::{CommunityWithSummary, DocumentEntityGraph};
 use crate::retrieve::ScoredChunk;
 
 pub mod models;
@@ -171,6 +171,64 @@ pub trait StorageBackend: Send + Sync {
         file_path: Option<&str>,
         document_id: Option<Uuid>,
     ) -> Result<Option<(String, i64)>, sqlx::Error>;
+
+    /**
+     * Persists detected communities and their entity memberships. Replaces any
+     * existing communities for the given project scope.
+     */
+    async fn save_communities(
+        &self,
+        _project: Option<&str>,
+        _communities: &[CommunityWithSummary],
+    ) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    /**
+     * Deletes all communities for a project scope so they can be re-detected
+     * from the current entity graph. Pass `None` to delete global communities.
+     */
+    async fn delete_project_communities(
+        &self,
+        _project: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    /**
+     * Returns communities that contain any of the supplied entity IDs
+     * (local-tier lookup). Includes global communities in all results.
+     */
+    async fn get_communities_for_entities(
+        &self,
+        _project: Option<&str>,
+        _entity_ids: &[Uuid],
+    ) -> Result<Vec<models::StoredCommunity>, sqlx::Error> {
+        Ok(Vec::new())
+    }
+
+    /**
+     * Performs ANN search over community summary embeddings for global-tier
+     * retrieval. Returns the top-k most semantically similar communities.
+     */
+    async fn search_communities_by_embedding(
+        &self,
+        _project: Option<&str>,
+        _query_embedding: &[f32],
+        _top_k: i64,
+    ) -> Result<Vec<models::StoredCommunity>, sqlx::Error> {
+        Ok(Vec::new())
+    }
+
+    /**
+     * Lists all communities for the MCP resource endpoint.
+     */
+    async fn list_communities(
+        &self,
+        _project: Option<&str>,
+    ) -> Result<Vec<models::StoredCommunity>, sqlx::Error> {
+        Ok(Vec::new())
+    }
 }
 
 /**

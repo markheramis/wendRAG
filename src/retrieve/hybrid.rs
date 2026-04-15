@@ -5,7 +5,7 @@ use crate::embed::provider::EmbeddingError;
 use crate::entity::GraphSettings;
 use crate::store::{SearchFilters, StorageBackend};
 
-use super::{ScoredChunk, dense, fusion, sparse};
+use super::{ScoredChunk, community, dense, fusion, sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HybridSearchError {
@@ -48,10 +48,7 @@ pub async fn search(
     let mut branches = vec![dense_results, sparse_results];
     if graph_settings.enabled {
         let seed_results = fusion::reciprocal_rank_fusion(&branches, top_k as usize);
-        let seed_chunk_ids = seed_results
-            .iter()
-            .map(|chunk| chunk.chunk_id)
-            .collect::<Vec<_>>();
+        let seed_chunk_ids: Vec<_> = seed_results.iter().map(|c| c.chunk_id).collect();
         let graph_results = storage
             .search_graph(
                 &seed_chunk_ids,
@@ -62,6 +59,20 @@ pub async fn search(
             .await?;
         if !graph_results.is_empty() {
             branches.push(graph_results);
+        }
+
+        let community_results = community::search(
+            storage,
+            &dense_embedding,
+            &seed_chunk_ids,
+            top_k,
+            filters,
+            graph_settings.traversal_depth,
+        )
+        .await
+        .unwrap_or_default();
+        if !community_results.is_empty() {
+            branches.push(community_results);
         }
     }
 

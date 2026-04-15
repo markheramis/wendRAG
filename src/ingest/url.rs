@@ -105,13 +105,26 @@ fn is_ipv6_link_local(ip: &std::net::Ipv6Addr) -> bool {
  * - Performs network requests to `robots.txt` and the target URL.
  */
 pub async fn read_url_document(path: &str) -> Result<ReadDocument, ReadError> {
+    read_url_document_with_options(path, true).await
+}
+
+/**
+ * URL ingestion with configurable SSRF protection. Production callers use
+ * `read_url_document` (always enforced). Integration tests pass `false` so
+ * they can reach a local Axum server on 127.0.0.1.
+ */
+pub async fn read_url_document_with_options(
+    path: &str,
+    enforce_ssrf: bool,
+) -> Result<ReadDocument, ReadError> {
     let parsed_url: Url = Url::parse(path).map_err(|error| ReadError::InvalidUrl {
         path: path.to_string(),
         reason: error.to_string(),
     })?;
 
-    // SECURITY: Validate URL doesn't point to private/internal addresses (SSRF protection)
-    validate_url_not_private(&parsed_url)?;
+    if enforce_ssrf {
+        validate_url_not_private(&parsed_url)?;
+    }
     let client: Client = Client::builder()
         .timeout(Duration::from_secs(URL_FETCH_TIMEOUT_SECS))
         .user_agent(URL_INGEST_USER_AGENT)

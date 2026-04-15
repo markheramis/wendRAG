@@ -12,6 +12,21 @@ pub struct Document {
     pub updated_at: DateTime<Utc>,
 }
 
+/**
+ * Read-only projection of a detected entity community. Embeddings are kept
+ * internal to the storage layer (used only for ANN search), so this struct
+ * stays lean for serialization and MCP resource responses.
+ */
+#[derive(Debug, Clone)]
+pub struct StoredCommunity {
+    pub id: Uuid,
+    pub name: String,
+    pub summary: Option<String>,
+    pub project: Option<String>,
+    pub importance: f32,
+    pub entity_count: i64,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct DocumentWithChunkCount {
     pub id: Uuid,

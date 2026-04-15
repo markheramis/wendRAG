@@ -1,15 +1,15 @@
 /**
  * MCP resource handler methods for the WendRagServer, building JSON payloads
- * for the `rag://status`, `rag://documents`, `rag://documents/{id}`, and
- * `rag://config` resources.
+ * for the `rag://status`, `rag://documents`, `rag://documents/{id}`,
+ * `rag://config`, and `rag://communities` resources.
  */
 
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, ResourceContents};
 
 use super::server::{
-    CONFIG_RESOURCE_URI, DOCUMENTS_RESOURCE_URI, DOCUMENT_DETAIL_URI_PREFIX, STATUS_RESOURCE_URI,
-    WendRagServer,
+    COMMUNITIES_RESOURCE_URI, CONFIG_RESOURCE_URI, DOCUMENTS_RESOURCE_URI,
+    DOCUMENT_DETAIL_URI_PREFIX, STATUS_RESOURCE_URI, WendRagServer,
 };
 
 impl WendRagServer {
@@ -159,6 +159,36 @@ impl WendRagServer {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             payload.to_string(),
             CONFIG_RESOURCE_URI,
+        )
+        .with_mime_type("application/json")]))
+    }
+
+    /**
+     * Builds the `rag://communities` resource payload: all detected entity
+     * communities with their names, summaries, importance, and entity counts.
+     */
+    pub(super) async fn resource_communities(&self) -> Result<ReadResourceResult, ErrorData> {
+        let communities = self
+            .storage
+            .list_communities(None)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let payload = serde_json::json!({
+            "total": communities.len(),
+            "communities": communities.iter().map(|c| serde_json::json!({
+                "id": c.id.to_string(),
+                "name": c.name,
+                "summary": c.summary,
+                "project": c.project,
+                "importance": c.importance,
+                "entity_count": c.entity_count,
+            })).collect::<Vec<_>>(),
+        });
+
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            payload.to_string(),
+            COMMUNITIES_RESOURCE_URI,
         )
         .with_mime_type("application/json")]))
     }
