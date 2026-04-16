@@ -26,6 +26,8 @@ use crate::entity::{EntityExtractor, GraphSettings};
 use crate::ingest::pipeline;
 use crate::ingest::pipeline::{ContentIngestRequest, DirectoryIngestRequest, IngestOptions};
 use crate::ingest::reader::detect_file_type;
+use crate::memory::manager::MemoryManager;
+use crate::memory::types::{MemoryScope, MemoryType};
 use crate::rerank::RerankerProvider;
 use crate::retrieve::router::{QueryRouter, QueryRouterConfig, QueryScope};
 use crate::retrieve::{ScoredChunk, SearchMode};
@@ -42,6 +44,7 @@ pub(super) const STATUS_RESOURCE_URI: &str = "rag://status";
 pub(super) const DOCUMENTS_RESOURCE_URI: &str = "rag://documents";
 pub(super) const CONFIG_RESOURCE_URI: &str = "rag://config";
 pub(super) const COMMUNITIES_RESOURCE_URI: &str = "rag://communities";
+pub(super) const MEMORY_STATUS_RESOURCE_URI: &str = "rag://memory/status";
 pub(super) const DOCUMENT_DETAIL_URI_TEMPLATE: &str = "rag://documents/{id}";
 pub(super) const DOCUMENT_DETAIL_URI_PREFIX: &str = "rag://documents/";
 
@@ -75,6 +78,7 @@ pub struct WendRagServer {
     graph_settings: GraphSettings,
     query_router: Arc<QueryRouter>,
     community_config: CommunityConfig,
+    pub(super) memory_manager: Option<Arc<MemoryManager>>,
     chunking_strategy: ChunkingStrategy,
     semantic_threshold: f64,
     chunking_max_sentences: usize,
@@ -101,6 +105,7 @@ impl WendRagServer {
         reranker_top_n: usize,
         graph_settings: GraphSettings,
         community_config: CommunityConfig,
+        memory_manager: Option<Arc<MemoryManager>>,
         chunking_strategy: ChunkingStrategy,
         semantic_threshold: f64,
         chunking_max_sentences: usize,
@@ -116,6 +121,7 @@ impl WendRagServer {
             graph_settings,
             query_router: Arc::new(QueryRouter::new(QueryRouterConfig::default())),
             community_config,
+            memory_manager,
             chunking_strategy,
             semantic_threshold,
             chunking_max_sentences,
@@ -656,6 +662,148 @@ impl WendRagServer {
             Err(e) => json_err(&e.to_string()),
         }
     }
+
+    #[tool(description = "Store a memory entry (fact, preference, event, or summary) for later retrieval.")]
+    async fn memory_store(&self, Parameters(input): Parameters<MemoryStoreInput>) -> String {
+        let Some(mm) = &self.memory_manager else {
+            return json_err("memory subsystem is not enabled");
+        };
+
+        let scope = match input.scope.as_deref() {
+            Some("session") => MemoryScope::Session,
+            Some("global") => MemoryScope::Global,
+            _ => MemoryScope::User,
+        };
+        let entry_type = match input.entry_type.as_deref() {
+            Some("preference") => MemoryType::Preference,
+            Some("event") => MemoryType::Event,
+            Some("summary") => MemoryType::Summary,
+            Some("message") => MemoryType::Message,
+            _ => MemoryType::Fact,
+        };
+        let importance = input.importance.unwrap_or(0.5);
+
+        match mm
+            .store_memory(scope, input.session_id, input.user_id, input.content, entry_type, importance)
+            .await
+        {
+            Ok(entry) => serde_json::to_string(&MemoryStoreOutput {
+                memory_id: entry.id.to_string(),
+                scope: entry.scope.as_str().to_string(),
+                entry_type: entry.metadata.entry_type.as_str().to_string(),
+            })
+            .unwrap_or_else(|e| json_err(&e.to_string())),
+            Err(e) => json_err(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Search stored memories using semantic similarity. Returns relevant facts, preferences, and past interactions.")]
+    async fn memory_retrieve(&self, Parameters(input): Parameters<MemoryRetrieveInput>) -> String {
+        let Some(mm) = &self.memory_manager else {
+            return json_err("memory subsystem is not enabled");
+        };
+
+        let limit = input.limit.unwrap_or(10) as usize;
+        match mm.retrieve_memories(&input.query, input.user_id.as_deref(), Some(limit)).await {
+            Ok(entries) => {
+                let items: Vec<MemoryItem> = entries
+                    .iter()
+                    .map(|e| MemoryItem {
+                        id: e.id.to_string(),
+                        content: e.content.clone(),
+                        scope: e.scope.as_str().to_string(),
+                        entry_type: e.metadata.entry_type.as_str().to_string(),
+                        importance: e.importance_score,
+                        created_at: e.created_at.to_rfc3339(),
+                    })
+                    .collect();
+                serde_json::to_string(&MemoryRetrieveOutput { memories: items })
+                    .unwrap_or_else(|e| json_err(&e.to_string()))
+            }
+            Err(e) => json_err(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Forget (delete or invalidate) a memory entry by its ID.")]
+    async fn memory_forget(&self, Parameters(input): Parameters<MemoryForgetInput>) -> String {
+        let Some(mm) = &self.memory_manager else {
+            return json_err("memory subsystem is not enabled");
+        };
+
+        let Some(id_str) = &input.memory_id else {
+            return json_err("memory_id is required");
+        };
+        let id = match id_str.parse::<uuid::Uuid>() {
+            Ok(id) => id,
+            Err(e) => return json_err(&format!("invalid memory_id: {e}")),
+        };
+
+        let invalidate = input.invalidate.unwrap_or(true);
+        let result = if invalidate {
+            mm.invalidate_memory(id).await
+        } else {
+            mm.delete_memory(id).await
+        };
+
+        match result {
+            Ok(done) => serde_json::to_string(&MemoryForgetOutput {
+                forgotten: done,
+                action: if invalidate { "invalidated" } else { "deleted" }.to_string(),
+            })
+            .unwrap_or_else(|e| json_err(&e.to_string())),
+            Err(e) => json_err(&e.to_string()),
+        }
+    }
+
+    #[tool(description = "Manage memory sessions: list active sessions, get session context, or end a session.")]
+    async fn memory_sessions(&self, Parameters(input): Parameters<MemorySessionsInput>) -> String {
+        let Some(mm) = &self.memory_manager else {
+            return json_err("memory subsystem is not enabled");
+        };
+
+        match input.action.as_deref().unwrap_or("list") {
+            "list" => {
+                let sessions = mm.list_sessions();
+                serde_json::to_string(&serde_json::json!({
+                    "active_sessions": sessions,
+                    "count": sessions.len(),
+                }))
+                .unwrap_or_else(|e| json_err(&e.to_string()))
+            }
+            "get" => {
+                let Some(sid) = &input.session_id else {
+                    return json_err("session_id is required for 'get' action");
+                };
+                match mm.get_session_context(sid).await {
+                    Some(ctx) => serde_json::to_string(&serde_json::json!({
+                        "session_id": ctx.session_id,
+                        "message_count": ctx.message_count,
+                        "created_at": ctx.created_at.to_rfc3339(),
+                        "last_active": ctx.last_active.to_rfc3339(),
+                        "has_summary": ctx.summary.is_some(),
+                    }))
+                    .unwrap_or_else(|e| json_err(&e.to_string())),
+                    None => json_err(&format!("session not found: {sid}")),
+                }
+            }
+            "end" => {
+                let Some(sid) = &input.session_id else {
+                    return json_err("session_id is required for 'end' action");
+                };
+                match mm.end_session(sid, true, input.user_id.as_deref()).await {
+                    Ok(Some(entry)) => serde_json::to_string(&serde_json::json!({
+                        "ended": true,
+                        "persisted_memory_id": entry.id.to_string(),
+                    }))
+                    .unwrap_or_else(|e| json_err(&e.to_string())),
+                    Ok(None) => serde_json::to_string(&serde_json::json!({ "ended": true }))
+                        .unwrap_or_else(|e| json_err(&e.to_string())),
+                    Err(e) => json_err(&e.to_string()),
+                }
+            }
+            other => json_err(&format!("unknown action: {other}")),
+        }
+    }
 }
 
 // ─── MCP server handler ───────────────────────────────────────────────────────
@@ -717,6 +865,15 @@ impl ServerHandler for WendRagServer {
                     .with_mime_type("application/json"),
                 None,
             ),
+            Annotated::new(
+                RawResource::new(MEMORY_STATUS_RESOURCE_URI, "memory-status")
+                    .with_title("Memory Status")
+                    .with_description(
+                        "Memory subsystem status: active sessions, memory counts, and behavioral protocol.",
+                    )
+                    .with_mime_type("application/json"),
+                None,
+            ),
         ]))
     }
 
@@ -749,6 +906,7 @@ impl ServerHandler for WendRagServer {
             DOCUMENTS_RESOURCE_URI => self.resource_documents().await,
             CONFIG_RESOURCE_URI => self.resource_config(),
             COMMUNITIES_RESOURCE_URI => self.resource_communities().await,
+            MEMORY_STATUS_RESOURCE_URI => self.resource_memory_status().await,
             uri if uri.starts_with(DOCUMENT_DETAIL_URI_PREFIX) => {
                 let id = uri[DOCUMENT_DETAIL_URI_PREFIX.len()..].to_owned();
                 self.resource_document_detail(&id).await
@@ -821,6 +979,7 @@ mod tests {
             30,
             GraphSettings::new(false, 2),
             CommunityConfig::default(),
+            None,
             crate::config::ChunkingStrategy::Fixed,
             0.25,
             20,

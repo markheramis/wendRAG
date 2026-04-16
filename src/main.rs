@@ -8,6 +8,7 @@ use wend_rag::embed::{self, OllamaProvider, OpenAiCompatProvider};
 use wend_rag::entity::{EntityExtractor, OpenAiCompatEntityExtractor};
 use wend_rag::ingest::pipeline;
 use wend_rag::mcp::server::{ServerConfig, WendRagServer};
+use wend_rag::memory;
 use wend_rag::observability;
 use wend_rag::rerank::{self, RerankerProvider};
 use wend_rag::store;
@@ -98,6 +99,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::from(rerank::build_reranker(&cfg.reranker)) as Arc<dyn RerankerProvider>
     });
 
+    let memory_manager: Option<Arc<memory::MemoryManager>> = if cfg.memory.enabled {
+        let mem_storage: Arc<dyn memory::MemoryStorage> = match cfg.storage_backend {
+            StorageBackendKind::Postgres => {
+                let db_url = cfg.database_url.as_deref().unwrap_or("");
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(cfg.pool.max_connections)
+                    .acquire_timeout(cfg.pool.acquire_timeout)
+                    .connect(db_url)
+                    .await?;
+                Arc::new(memory::PostgresMemoryStorage::new(pool))
+            }
+            StorageBackendKind::Sqlite => {
+                let pool = store::connect_sqlite_pool(&cfg.sqlite_path, &cfg.pool).await?;
+                Arc::new(memory::SqliteMemoryStorage::new(pool))
+            }
+        };
+        tracing::info!("memory subsystem enabled");
+        Some(Arc::new(memory::MemoryManager::new(
+            cfg.memory.clone(),
+            mem_storage,
+            embedder.clone(),
+        )))
+    } else {
+        None
+    };
+
     match cli.command {
         Command::Ingest { path } => {
             run_cli_ingest(
@@ -116,11 +143,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Daemon => {
             let host = cfg.host.clone();
             let port = cfg.port;
-            let server = build_server(cfg, storage, embedder, entity_extractor, reranker);
+            if let Some(ref mm) = memory_manager {
+                let interval = std::time::Duration::from_secs(
+                    (cfg.memory.consolidation_interval_hours * 3600).max(60) as u64,
+                );
+                memory::maintenance::spawn_maintenance_task(Arc::clone(mm), interval);
+            }
+            let server = build_server(cfg, storage, embedder, entity_extractor, reranker, memory_manager);
             serve_http(server, &host, port).await
         }
         Command::Stdio => {
-            let server = build_server(cfg, storage, embedder, entity_extractor, reranker);
+            if let Some(ref mm) = memory_manager {
+                let interval = std::time::Duration::from_secs(
+                    (cfg.memory.consolidation_interval_hours * 3600).max(60) as u64,
+                );
+                memory::maintenance::spawn_maintenance_task(Arc::clone(mm), interval);
+            }
+            let server = build_server(cfg, storage, embedder, entity_extractor, reranker, memory_manager);
             serve_stdio(server).await
         }
     }
@@ -136,6 +175,7 @@ fn build_server(
     embedder: Arc<dyn embed::EmbeddingProvider>,
     entity_extractor: Option<Arc<dyn EntityExtractor>>,
     reranker: Option<Arc<dyn RerankerProvider>>,
+    memory_manager: Option<Arc<memory::MemoryManager>>,
 ) -> WendRagServer {
     let server_config = ServerConfig {
         storage_backend: match cfg.storage_backend {
@@ -181,6 +221,7 @@ fn build_server(
         cfg.reranker.top_n,
         cfg.graph_settings,
         cfg.community.clone(),
+        memory_manager,
         cfg.chunking_strategy,
         cfg.chunking_semantic_threshold,
         cfg.chunking_max_sentences,

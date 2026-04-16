@@ -16,15 +16,21 @@
  */
 
 pub mod buffer;
+pub mod maintenance;
 pub mod manager;
+pub mod pg_storage;
 pub mod retrieval;
+pub mod sqlite_storage;
 pub mod storage;
 pub mod types;
 
 pub use buffer::{SessionBuffer, SessionConfig};
-pub use manager::{MemoryManager, MemoryConfig, MaintenanceResult};
-pub use retrieval::{MemoryRetriever, MemoryContext, RetrievalStrategy};
-pub use types::{MemoryEntry, MemoryScope, MemoryType, ChatMessage, MemoryMetadata};
+pub use manager::{MaintenanceResult, MemoryConfig, MemoryManager};
+pub use pg_storage::PostgresMemoryStorage;
+pub use retrieval::{MemoryContext, MemoryRetriever, RetrievalStrategy};
+pub use sqlite_storage::SqliteMemoryStorage;
+pub use storage::{MemoryStorage, MemoryStorageError};
+pub use types::{ChatMessage, MemoryEntry, MemoryMetadata, MemoryScope, MemoryType};
 
 use chrono::{DateTime, Utc};
 

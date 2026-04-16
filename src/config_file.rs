@@ -22,6 +22,7 @@ pub struct FileConfig {
     pub chunking: ChunkingSection,
     pub reranker: RerankerSection,
     pub community: CommunitySection,
+    pub memory: MemorySection,
     pub pool: PoolSection,
 }
 
@@ -107,6 +108,21 @@ pub struct CommunitySection {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+}
+
+/**
+ * Memory / session layer configuration controlling persistence, decay,
+ * and retrieval behavior for agent-oriented memory.
+ */
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MemorySection {
+    pub enabled: Option<bool>,
+    pub session_timeout: Option<i64>,
+    pub decay_rate: Option<f32>,
+    pub prune_threshold: Option<f32>,
+    pub max_per_query: Option<usize>,
+    pub recency_weight: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -9,7 +9,7 @@ use rmcp::model::{ReadResourceResult, ResourceContents};
 
 use super::server::{
     COMMUNITIES_RESOURCE_URI, CONFIG_RESOURCE_URI, DOCUMENTS_RESOURCE_URI,
-    DOCUMENT_DETAIL_URI_PREFIX, STATUS_RESOURCE_URI, WendRagServer,
+    DOCUMENT_DETAIL_URI_PREFIX, MEMORY_STATUS_RESOURCE_URI, STATUS_RESOURCE_URI, WendRagServer,
 };
 
 impl WendRagServer {
@@ -189,6 +189,43 @@ impl WendRagServer {
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             payload.to_string(),
             COMMUNITIES_RESOURCE_URI,
+        )
+        .with_mime_type("application/json")]))
+    }
+
+    /**
+     * Builds the `rag://memory/status` resource: active sessions, memory
+     * counts by scope, and the behavioral protocol that agents should follow.
+     */
+    pub(super) async fn resource_memory_status(&self) -> Result<ReadResourceResult, ErrorData> {
+        let (_enabled, stats_json) = if let Some(mm) = &self.memory_manager {
+            let stats = mm.get_stats().await;
+            let by_scope: serde_json::Value = stats
+                .memories_by_scope
+                .iter()
+                .fold(serde_json::json!({}), |mut acc, (scope, count)| {
+                    acc[scope] = serde_json::json!(count);
+                    acc
+                });
+            (
+                true,
+                serde_json::json!({
+                    "enabled": true,
+                    "active_sessions": stats.active_sessions,
+                    "total_memories": stats.total_memories,
+                    "memories_by_scope": by_scope,
+                    "protocol": "Search memory before answering questions about past interactions. \
+                                 Store important facts, preferences, and decisions. \
+                                 Invalidate stale facts when corrections are provided.",
+                }),
+            )
+        } else {
+            (false, serde_json::json!({ "enabled": false }))
+        };
+
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            stats_json.to_string(),
+            MEMORY_STATUS_RESOURCE_URI,
         )
         .with_mime_type("application/json")]))
     }

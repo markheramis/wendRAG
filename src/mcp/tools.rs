@@ -166,3 +166,79 @@ pub struct DeleteSourceOutput {
     pub file_path: Option<String>,
     pub chunk_count_removed: i64,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemoryStoreInput {
+    /// Content to store as a memory.
+    pub content: String,
+    /// Scope: "session", "user", or "global". Defaults to "user".
+    pub scope: Option<String>,
+    /// Entry type: "fact", "preference", "event", "summary", or "message". Defaults to "fact".
+    pub entry_type: Option<String>,
+    /// User identifier for user-scoped memories.
+    pub user_id: Option<String>,
+    /// Session identifier for session-scoped memories.
+    pub session_id: Option<String>,
+    /// Importance score (0.0 to 1.0). Defaults to 0.5.
+    pub importance: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryStoreOutput {
+    pub memory_id: String,
+    pub scope: String,
+    pub entry_type: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemoryRetrieveInput {
+    /// Search query for semantic memory retrieval.
+    pub query: String,
+    /// Filter by user ID.
+    pub user_id: Option<String>,
+    /// Filter by session ID.
+    pub session_id: Option<String>,
+    /// Filter by scope: "session", "user", or "global".
+    pub scope: Option<String>,
+    /// Maximum results to return. Defaults to 10.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryRetrieveOutput {
+    pub memories: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryItem {
+    pub id: String,
+    pub content: String,
+    pub scope: String,
+    pub entry_type: String,
+    pub importance: f32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemoryForgetInput {
+    /// Specific memory ID to forget.
+    pub memory_id: Option<String>,
+    /// If true, soft-delete (mark as invalidated) instead of hard delete. Defaults to true.
+    pub invalidate: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryForgetOutput {
+    pub forgotten: bool,
+    pub action: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemorySessionsInput {
+    /// Action: "list", "get", or "end". Defaults to "list".
+    pub action: Option<String>,
+    /// Session ID for "get" or "end" actions.
+    pub session_id: Option<String>,
+    /// User ID to associate with the session on "end" (for persisting summary).
+    pub user_id: Option<String>,
+}

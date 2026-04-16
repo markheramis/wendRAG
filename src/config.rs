@@ -508,7 +508,43 @@ impl Config {
                 llm_model: community_llm_model,
                 llm_api_key: community_llm_api_key,
             },
-            memory: MemoryConfig::default(),
+            memory: {
+                let mem_enabled_str = yaml_or_env(
+                    "WEND_RAG_MEMORY_ENABLED",
+                    fc.memory.enabled.map(|b| b.to_string()),
+                );
+                let mem_enabled = parse_loose_bool(mem_enabled_str.as_deref(), false);
+
+                let mem_session_timeout = fc.memory.session_timeout
+                    .or_else(|| env::var("WEND_RAG_MEMORY_SESSION_TIMEOUT").ok().and_then(|v| v.parse().ok()))
+                    .unwrap_or(3600);
+
+                let mem_decay_rate = fc.memory.decay_rate
+                    .or_else(|| env::var("WEND_RAG_MEMORY_DECAY_RATE").ok().and_then(|v| v.parse().ok()))
+                    .unwrap_or(0.02);
+
+                let mem_prune_threshold = fc.memory.prune_threshold
+                    .or_else(|| env::var("WEND_RAG_MEMORY_PRUNE_THRESHOLD").ok().and_then(|v| v.parse().ok()))
+                    .unwrap_or(0.3);
+
+                let mem_max_per_query = fc.memory.max_per_query
+                    .or_else(|| env::var("WEND_RAG_MEMORY_MAX_PER_QUERY").ok().and_then(|v| v.parse().ok()))
+                    .unwrap_or(20);
+
+                let mem_recency_weight = fc.memory.recency_weight
+                    .or_else(|| env::var("WEND_RAG_MEMORY_RECENCY_WEIGHT").ok().and_then(|v| v.parse().ok()))
+                    .unwrap_or(0.3);
+
+                MemoryConfig {
+                    enabled: mem_enabled,
+                    session_timeout_seconds: mem_session_timeout,
+                    decay_rate: mem_decay_rate,
+                    prune_threshold: mem_prune_threshold,
+                    max_memories_per_query: mem_max_per_query,
+                    recency_weight: mem_recency_weight,
+                    ..MemoryConfig::default()
+                }
+            },
             pool: PoolConfig {
                 max_connections: pool_max_connections,
                 acquire_timeout: Duration::from_secs(pool_acquire_timeout_secs),

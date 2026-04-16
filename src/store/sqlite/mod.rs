@@ -4,7 +4,7 @@
  */
 
 mod community;
-mod embeddings;
+pub(crate) mod embeddings;
 mod entity_graph;
 mod filters;
 mod mappers;

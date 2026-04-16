@@ -285,7 +285,7 @@ pub(crate) fn sqlite_connect_options(
  * Creates the SQLite pool used by the local backend. Pool size and acquire
  * timeout are driven by the caller-provided [`PoolConfig`].
  */
-pub(crate) async fn connect_sqlite_pool(
+pub async fn connect_sqlite_pool(
     sqlite_path: &str,
     pool_cfg: &PoolConfig,
 ) -> Result<sqlx::SqlitePool, StoreInitError> {
