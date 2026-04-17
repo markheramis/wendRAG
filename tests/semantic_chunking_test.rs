@@ -1,4 +1,4 @@
-/**
+/*!
  * Tests for semantic chunking quality and correctness.
  * Verifies that chunks maintain meaning and boundaries are detected properly.
  */
@@ -124,7 +124,7 @@ async fn test_semantic_chunking_detects_topic_boundaries() {
     // We accept 1+ chunks - the key is that the algorithm attempted semantic processing
     // (verified by the mock embedder being called and no panics)
     assert!(
-        chunks.len() >= 1,
+        !chunks.is_empty(),
         "Expected at least 1 chunk, got {}",
         chunks.len()
     );

@@ -1,4 +1,4 @@
-/**
+/*!
  * Text normalization and cleaning utilities shared by entity extraction,
  * graph aggregation, and storage backends.
  */
@@ -10,7 +10,6 @@ const DEFAULT_ENTITY_TYPE: &str = "CONCEPT";
  */
 pub(crate) fn normalize_entity_name(value: &str) -> String {
     value
-        .trim()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

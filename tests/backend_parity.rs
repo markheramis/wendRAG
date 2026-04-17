@@ -444,11 +444,13 @@ async fn graph_retrieval_works_on_all_backends() -> TestResult<()> {
 }
 
 /**
- * Verifies that every backend can return a document's stored chunks in stable
- * chunk order so the MCP layer can reconstruct full-document context.
+ * Verifies that every backend returns a document's stored chunks in stable
+ * ascending chunk-index order. The `rag://documents/{id}` MCP resource
+ * relies on this ordering to display the full chunk listing for a
+ * document.
  */
 #[tokio::test]
-async fn backends_return_ordered_document_chunks_for_full_context() -> TestResult<()> {
+async fn backends_return_ordered_document_chunks() -> TestResult<()> {
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
     let no_tags: Vec<String> = Vec::new();
 
@@ -501,6 +503,154 @@ async fn backends_return_ordered_document_chunks_for_full_context() -> TestResul
                 .windows(2)
                 .all(|pair| pair[0].chunk_index < pair[1].chunk_index),
             "{} backend should return chunks in ascending chunk_index order",
+            harness.name
+        );
+
+        harness.cleanup().await?;
+    }
+
+    Ok(())
+}
+
+/**
+ * Exercises `StorageBackend::get_chunks_by_index` on both backends,
+ * covering:
+ *
+ * 1. Looking up a single target chunk by `file_path`.
+ * 2. Looking up the same chunk by `document_id` and confirming both
+ *    selectors return identical rows.
+ * 3. Requesting a window that spans several neighbouring chunks.
+ * 4. Windows that extend past the document's last chunk are clipped
+ *    gracefully rather than producing a database error.
+ * 5. Ambiguous selector combinations (both / neither) return an empty
+ *    slice as documented on the trait.
+ */
+#[tokio::test]
+async fn backends_return_chunks_by_index() -> TestResult<()> {
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder);
+    let no_tags: Vec<String> = Vec::new();
+
+    for harness in available_backends().await? {
+        let file_path = format!("docs/{}/get-chunk.txt", harness.project);
+        // Crafted to produce at least 3 chunks so we can address a mid-
+        // document chunk with meaningful before/after neighbours.
+        let long_text = format!(
+            "{}{}{}",
+            "alpha ".repeat(180),
+            "bravo ".repeat(180),
+            "charlie ".repeat(180),
+        );
+        let output = pipeline::ingest_content(
+            &harness.storage,
+            &embedder,
+            ContentIngestRequest {
+                file_path: &file_path,
+                file_name: "get-chunk.txt",
+                file_type: "text",
+                text: &long_text,
+            },
+            &IngestOptions::new(
+                Some(&harness.project),
+                &no_tags,
+                None,
+                None,
+                ChunkingStrategy::Fixed,
+                0.25,
+                20,
+                false,
+            ),
+        )
+        .await?;
+
+        assert!(
+            output.chunk_count >= 3,
+            "{} backend should produce at least 3 chunks for the test document, got {}",
+            harness.name,
+            output.chunk_count
+        );
+        let last_index = (output.chunk_count - 1) as i32;
+        let target_index = last_index.min(1);
+
+        // 1. Single chunk lookup by file_path.
+        let by_path = harness
+            .storage
+            .get_chunks_by_index(Some(&file_path), None, target_index, target_index)
+            .await?;
+        assert_eq!(
+            by_path.len(),
+            1,
+            "{} backend should return exactly one chunk for a single-index window",
+            harness.name
+        );
+        let target = &by_path[0];
+        assert_eq!(target.chunk_index, target_index);
+        assert_eq!(target.file_path, file_path);
+        assert!(!target.content.is_empty());
+
+        // 2. Same chunk looked up by document_id returns the same body.
+        let by_id = harness
+            .storage
+            .get_chunks_by_index(None, Some(target.document_id), target_index, target_index)
+            .await?;
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(
+            by_id[0].content, target.content,
+            "{} backend: by-id and by-path must return the same chunk body",
+            harness.name
+        );
+
+        // 3. Window that spans neighbours.
+        let window_start = (target_index - 1).max(0);
+        let window_end = (target_index + 1).min(last_index);
+        let window = harness
+            .storage
+            .get_chunks_by_index(Some(&file_path), None, window_start, window_end)
+            .await?;
+        assert_eq!(
+            window.len() as i32,
+            window_end - window_start + 1,
+            "{} backend should return every chunk in [{window_start},{window_end}]",
+            harness.name
+        );
+        assert!(
+            window
+                .windows(2)
+                .all(|pair| pair[0].chunk_index < pair[1].chunk_index),
+            "{} backend must return the window in ascending chunk_index order",
+            harness.name
+        );
+
+        // 4. Oversized window clips to the document's actual range.
+        let clipped = harness
+            .storage
+            .get_chunks_by_index(Some(&file_path), None, 0, last_index + 1_000)
+            .await?;
+        assert_eq!(
+            clipped.len() as i32,
+            last_index + 1,
+            "{} backend should clip a trailing-oversized window",
+            harness.name
+        );
+
+        // 5a. Ambiguous selectors (both set) yield an empty slice.
+        let both = harness
+            .storage
+            .get_chunks_by_index(Some(&file_path), Some(target.document_id), 0, last_index)
+            .await?;
+        assert!(
+            both.is_empty(),
+            "{} backend: supplying both selectors must yield an empty result",
+            harness.name
+        );
+
+        // 5b. Neither selector likewise yields an empty slice.
+        let neither = harness
+            .storage
+            .get_chunks_by_index(None, None, 0, last_index)
+            .await?;
+        assert!(
+            neither.is_empty(),
+            "{} backend: supplying no selector must yield an empty result",
             harness.name
         );
 
@@ -770,7 +920,7 @@ async fn postgres_harness() -> TestResult<Option<BackendHarness>> {
 async fn serve_test_robots(State(state): State<Arc<UrlTestState>>) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/plain; charset=utf-8")],
-        (*state).robots_txt.clone(),
+        state.robots_txt.clone(),
     )
 }
 
@@ -780,7 +930,7 @@ async fn serve_test_robots(State(state): State<Arc<UrlTestState>>) -> impl IntoR
 async fn serve_test_article(State(state): State<Arc<UrlTestState>>) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/html; charset=utf-8")],
-        (*state).article_html.clone(),
+        state.article_html.clone(),
     )
 }
 

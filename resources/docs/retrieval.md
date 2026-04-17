@@ -2,7 +2,7 @@
 
 ## Retrieval Modes
 
-wendRAG supports three search modes selectable per request via the `mode` parameter on `rag_get_context` and `rag_get_full_context`.
+wendRAG supports three search modes selectable per request via the `mode` parameter on `rag_get_context`. When a returned chunk is truncated mid-block (for example, a Mermaid diagram split across chunk boundaries), use `rag_get_chunk` to pull the target chunk together with any number of contiguous neighbours.
 
 ### Dense retrieval
 
@@ -24,14 +24,19 @@ Runs dense and sparse branches in parallel, then combines the ranked results usi
 
 ## Graph-Augmented Retrieval
 
-When `GRAPH_RETRIEVAL_ENABLED=true`, hybrid search adds a third graph branch:
+When `WEND_RAG_GRAPH_RETRIEVAL_ENABLED=true`, hybrid search adds a third graph branch:
 
 1. Dense and sparse search run as usual and are fused with RRF.
 2. The top fused chunks seed entity lookup through `entity_mentions`.
-3. A recursive CTE traverses `entity_relationships` up to `GRAPH_TRAVERSAL_DEPTH` hops.
+3. A recursive CTE traverses `entity_relationships` up to `WEND_RAG_GRAPH_TRAVERSAL_DEPTH` hops.
 4. Chunks mentioning related entities are scored as a third RRF branch and fused back into the final ranking.
 
-Entity extraction must be enabled at ingestion time (`ENTITY_EXTRACTION_ENABLED=true`) for graph retrieval to have data to work with. See [configuration.md](configuration.md) for endpoint and model options.
+The graph and community branches are executed **concurrently** via
+`tokio::join!` once the initial dense + sparse fusion has produced the
+seed chunks, so enabling graph retrieval does not serialise extra
+round-trips against the database.
+
+Entity extraction must be enabled at ingestion time (`WEND_RAG_ENTITY_EXTRACTION_ENABLED=true`) for graph retrieval to have data to work with. See [configuration.md](configuration.md) for endpoint and model options.
 
 ## Community-Augmented Retrieval
 
@@ -68,8 +73,15 @@ After structural splitting, any section that still exceeds the per-type limit is
 |---|---|---|
 | Markdown, URL | 4 000 characters | Fixed window |
 | Text, PDF | 1 000 characters | Fixed window with 200-character overlap |
-| Any | topic boundaries | Semantic (when `CHUNKING_STRATEGY=semantic`) |
+| Any | topic boundaries | Semantic (when `WEND_RAG_CHUNKING_STRATEGY=semantic`) |
 
 ### Semantic chunking
 
-When `CHUNKING_STRATEGY=semantic`, the chunker uses embedding similarity to detect topic boundaries between candidate sections. The `CHUNKING_SEMANTIC_THRESHOLD` percentile (default `0.25`) controls sensitivity: lower values produce fewer, larger chunks; higher values produce more, smaller chunks.
+When `WEND_RAG_CHUNKING_STRATEGY=semantic`, the chunker uses embedding
+similarity to detect topic boundaries between candidate sections. The
+`WEND_RAG_CHUNKING_SEMANTIC_THRESHOLD` percentile (default `0.25`)
+controls sensitivity: lower values produce fewer, larger chunks; higher
+values produce more, smaller chunks. `WEND_RAG_CHUNKING_MAX_SENTENCES`
+(default `20`) is a hard upper bound enforced even when similarity is
+high, and `WEND_RAG_CHUNKING_FILTER_GARBAGE` (default `true`) removes
+navigation, ads, and boilerplate before chunking.

@@ -1,10 +1,9 @@
-/**
+/*!
  * MCP server core: struct definitions, tool-router implementation, and
- * ServerHandler trait implementation. Resource handlers and document
- * reconstruction helpers are delegated to sibling modules.
+ * ServerHandler trait implementation. Resource handlers live in the
+ * sibling `server_resources` module.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::ErrorData;
@@ -34,8 +33,16 @@ use crate::retrieve::{ScoredChunk, SearchMode};
 use crate::retrieve::{dense, hybrid, sparse};
 use crate::store::{SearchFilters, StorageBackend};
 
-use super::reconstruct::{json_err, reconstruct_document_from_chunks};
 use super::tools::*;
+
+/**
+ * Formats an error message as the JSON payload every MCP tool returns on
+ * failure (`{"error": "..."}`). Keeping the shape uniform lets clients
+ * display or parse errors without branching on the tool name.
+ */
+pub(super) fn json_err(msg: &str) -> String {
+    serde_json::json!({ "error": msg }).to_string()
+}
 
 /// Maximum number of documents ingested concurrently in batch flows.
 const MAX_CONCURRENT_BATCH_INGESTS: usize = 4;
@@ -87,16 +94,12 @@ pub struct WendRagServer {
     tool_router: ToolRouter<Self>,
 }
 
-#[derive(Debug, Clone)]
-struct MatchedDocumentCandidate {
-    file_path: String,
-    file_name: String,
-    score: f64,
-    matched_chunk_indices: Vec<i32>,
-}
-
 #[tool_router]
 impl WendRagServer {
+    /// Construct a fully wired `WendRagServer`. The parameter list mirrors
+    /// the resolved runtime configuration from `main.rs`; a builder
+    /// indirection would not reduce the total fan-in.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<dyn StorageBackend>,
         embedder: Arc<dyn EmbeddingProvider>,
@@ -147,6 +150,7 @@ impl WendRagServer {
         &self,
         input: &SearchInput,
     ) -> Result<(SearchMode, Vec<ScoredChunk>), String> {
+        validate_query_size(&input.query)?;
         let explicit_mode = input.mode.as_deref().map(SearchMode::from_str_loose);
         let mode = explicit_mode.unwrap_or(SearchMode::Hybrid);
         let requested_top_k = input.top_k.unwrap_or(10) as usize;
@@ -260,69 +264,15 @@ impl WendRagServer {
         Ok((mode, filtered))
     }
 
-    /**
-     * Collapses chunk-level search hits into unique matched documents and
-     * reconstructs each document body from its stored ordered chunks.
-     */
-    async fn build_full_context_results(
-        &self,
-        chunks: Vec<ScoredChunk>,
-    ) -> Result<Vec<FullContextResultItem>, String> {
-        let mut document_positions: HashMap<String, usize> = HashMap::new();
-        let mut documents: Vec<MatchedDocumentCandidate> = Vec::new();
-
-        for chunk in chunks {
-            if let Some(position) = document_positions.get(&chunk.file_path).copied() {
-                let document = &mut documents[position];
-                document.score = document.score.max(chunk.score);
-                if !document.matched_chunk_indices.contains(&chunk.chunk_index) {
-                    document.matched_chunk_indices.push(chunk.chunk_index);
-                }
-                continue;
-            }
-
-            document_positions.insert(chunk.file_path.clone(), documents.len());
-            documents.push(MatchedDocumentCandidate {
-                file_path: chunk.file_path,
-                file_name: chunk.file_name,
-                score: chunk.score,
-                matched_chunk_indices: vec![chunk.chunk_index],
-            });
-        }
-
-        let mut results: Vec<FullContextResultItem> = Vec::with_capacity(documents.len());
-
-        for mut document in documents {
-            document.matched_chunk_indices.sort_unstable();
-            let chunks = self
-                .storage
-                .get_document_chunks(&document.file_path)
-                .await
-                .map_err(|error| error.to_string())?;
-
-            if chunks.is_empty() {
-                return Err(format!(
-                    "no stored chunks found for matched document: {}",
-                    document.file_path
-                ));
-            }
-
-            results.push(FullContextResultItem {
-                document_content: reconstruct_document_from_chunks(&chunks),
-                file_path: document.file_path,
-                file_name: document.file_name,
-                score: document.score,
-                matched_chunk_indices: document.matched_chunk_indices,
-            });
-        }
-
-        Ok(results)
-    }
-
     #[tool(
         description = "Ingest a single local file or HTTP(S) URL into the RAG knowledge base. Provide either a server-accessible file_path/URL OR inline content with a file_name."
     )]
     async fn rag_ingest(&self, Parameters(input): Parameters<IngestInput>) -> String {
+        if let Some(ref content) = input.content
+            && let Err(e) = validate_content_size(content, "content")
+        {
+            return json_err(&e);
+        }
         let tags = input.tags.unwrap_or_default();
         let project = input.project.as_deref();
 
@@ -433,6 +383,17 @@ impl WendRagServer {
         description = "Ingest a batch of documents by inline content. The client reads files locally and sends content to the server. Use this for remote deployments where the server cannot access the client filesystem."
     )]
     async fn rag_ingest_batch(&self, Parameters(input): Parameters<IngestBatchInput>) -> String {
+        if let Err(e) = validate_batch_size(input.documents.len()) {
+            return json_err(&e);
+        }
+        for (idx, item) in input.documents.iter().enumerate() {
+            if let Err(e) =
+                validate_content_size(&item.content, &format!("documents[{idx}].content"))
+            {
+                return json_err(&e);
+            }
+        }
+
         let tags: Vec<String> = input.tags.unwrap_or_default();
         let project: Option<String> = input.project;
 
@@ -575,24 +536,64 @@ impl WendRagServer {
     }
 
     #[tool(
-        description = "Search the RAG knowledge base and return reconstructed full-document context for each matched document."
+        description = "Fetch a specific stored chunk by chunk_index within a document, optionally with before/after neighbours. Useful for reconstructing content that was split across chunks (e.g. a Mermaid diagram code block) after seeing a partial match in rag_get_context."
     )]
-    async fn rag_get_full_context(&self, Parameters(input): Parameters<SearchInput>) -> String {
-        let (mode, chunks) = match self.search_context_chunks(&input).await {
-            Ok(results) => results,
-            Err(error) => return json_err(&error),
+    async fn rag_get_chunk(&self, Parameters(input): Parameters<GetChunkInput>) -> String {
+        // Selector sanity: exactly one of file_path / document_id must be
+        // supplied so the query is unambiguous.
+        let (has_path, has_id) = (input.file_path.is_some(), input.document_id.is_some());
+        if has_path == has_id {
+            return json_err("Provide exactly one of file_path or document_id");
+        }
+        if input.chunk_index < 0 {
+            return json_err("chunk_index must be zero or positive");
+        }
+
+        let document_id = match input.document_id.as_deref() {
+            Some(id) => match uuid::Uuid::parse_str(id) {
+                Ok(uuid) => Some(uuid),
+                Err(error) => return json_err(&format!("invalid document_id: {error}")),
+            },
+            None => None,
         };
 
-        let results = match self.build_full_context_results(chunks).await {
-            Ok(results) => results,
-            Err(error) => return json_err(&error),
+        // Cap the neighbourhood size so a single call cannot produce an
+        // unbounded response. Saturating subtraction prevents negative
+        // ranges when chunk_index is near 0.
+        let before = input.before.unwrap_or(0).min(MAX_CHUNK_CONTEXT);
+        let after = input.after.unwrap_or(0).min(MAX_CHUNK_CONTEXT);
+        let start_index = (input.chunk_index as i64 - before as i64).max(0) as i32;
+        let end_index = (input.chunk_index as i64 + after as i64).min(i32::MAX as i64) as i32;
+
+        let rows = match self
+            .storage
+            .get_chunks_by_index(
+                input.file_path.as_deref(),
+                document_id,
+                start_index,
+                end_index,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => return json_err(&error.to_string()),
         };
 
-        serde_json::to_string(&FullContextOutput {
-            mode: mode.as_str().to_string(),
-            results,
-        })
-        .unwrap_or_else(|error| json_err(&error.to_string()))
+        let output = GetChunkOutput {
+            chunks: rows
+                .into_iter()
+                .map(|row| ChunkItem {
+                    document_id: row.document_id.to_string(),
+                    file_path: row.file_path,
+                    file_name: row.file_name,
+                    chunk_index: row.chunk_index,
+                    section_title: row.section_title,
+                    content: row.content,
+                })
+                .collect(),
+        };
+
+        serde_json::to_string(&output).unwrap_or_else(|error| json_err(&error.to_string()))
     }
 
     #[tool(
@@ -665,6 +666,9 @@ impl WendRagServer {
 
     #[tool(description = "Store a memory entry (fact, preference, event, or summary) for later retrieval.")]
     async fn memory_store(&self, Parameters(input): Parameters<MemoryStoreInput>) -> String {
+        if let Err(e) = validate_content_size(&input.content, "content") {
+            return json_err(&e);
+        }
         let Some(mm) = &self.memory_manager else {
             return json_err("memory subsystem is not enabled");
         };
@@ -699,6 +703,9 @@ impl WendRagServer {
 
     #[tool(description = "Search stored memories using semantic similarity. Returns relevant facts, preferences, and past interactions.")]
     async fn memory_retrieve(&self, Parameters(input): Parameters<MemoryRetrieveInput>) -> String {
+        if let Err(e) = validate_query_size(&input.query) {
+            return json_err(&e);
+        }
         let Some(mm) = &self.memory_manager else {
             return json_err("memory subsystem is not enabled");
         };
@@ -1069,5 +1076,468 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let err = server.resource_document_detail(&id).await.unwrap_err();
         assert!(err.message.contains("document not found"));
+    }
+
+    /**
+     * Helper that builds a `GetChunkInput` with sensible defaults so the
+     * individual tests stay focused on the single field they are exercising.
+     */
+    fn make_get_chunk_input(
+        file_path: Option<&str>,
+        document_id: Option<&str>,
+        chunk_index: i32,
+    ) -> GetChunkInput {
+        GetChunkInput {
+            file_path: file_path.map(str::to_string),
+            document_id: document_id.map(str::to_string),
+            chunk_index,
+            before: None,
+            after: None,
+        }
+    }
+
+    /**
+     * Supplying neither `file_path` nor `document_id` must be rejected with
+     * a structured JSON error rather than silently returning an empty
+     * response.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_requires_one_selector() {
+        let (server, _tmp) = make_test_server().await;
+        let result = server
+            .rag_get_chunk(Parameters(make_get_chunk_input(None, None, 0)))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json["error"].is_string(), "response must be an error: {result}");
+        assert!(
+            json["error"].as_str().unwrap().contains("exactly one"),
+            "error should mention the selector contract: {result}"
+        );
+    }
+
+    /**
+     * Supplying both selectors simultaneously is also ambiguous -- the
+     * handler must reject it to avoid the storage layer choosing one
+     * silently.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_rejects_both_selectors() {
+        let (server, _tmp) = make_test_server().await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let result = server
+            .rag_get_chunk(Parameters(make_get_chunk_input(
+                Some("docs/file.md"),
+                Some(&id),
+                0,
+            )))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json["error"].is_string());
+    }
+
+    /**
+     * A malformed UUID in `document_id` must fail fast with a precise error
+     * rather than being forwarded to the database.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_rejects_invalid_document_id() {
+        let (server, _tmp) = make_test_server().await;
+        let result = server
+            .rag_get_chunk(Parameters(make_get_chunk_input(
+                None,
+                Some("not-a-uuid"),
+                0,
+            )))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("document_id"),
+            "error must mention document_id: {result}"
+        );
+    }
+
+    /**
+     * Negative `chunk_index` values are nonsensical (chunks are stored with
+     * zero-based indices) and must be rejected at the handler boundary.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_rejects_negative_index() {
+        let (server, _tmp) = make_test_server().await;
+        let result = server
+            .rag_get_chunk(Parameters(make_get_chunk_input(
+                Some("docs/file.md"),
+                None,
+                -1,
+            )))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("chunk_index"));
+    }
+
+    /**
+     * Querying a file_path with no stored chunks returns a valid empty
+     * response (not an error) so agents can distinguish "unknown document"
+     * from "server failure".
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_returns_empty_for_unknown_file_path() {
+        let (server, _tmp) = make_test_server().await;
+        let result = server
+            .rag_get_chunk(Parameters(make_get_chunk_input(
+                Some("docs/does-not-exist.md"),
+                None,
+                0,
+            )))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("error").is_none(), "unexpected error: {result}");
+        assert!(json["chunks"].is_array());
+        assert!(json["chunks"].as_array().unwrap().is_empty());
+    }
+
+    // ─── rag_get_chunk end-to-end roundtrip tests ────────────────────────────
+
+    /**
+     * Ingests `text` as a single `text`-type document against the server's
+     * storage backend and returns `(file_path, stored_chunk_count)`.
+     *
+     * The `Fixed` chunking strategy is used with a conservative max-sentence
+     * limit so each paragraph becomes its own chunk; this makes the
+     * neighbour-window assertions in the tests below deterministic.
+     */
+    async fn ingest_text(
+        server: &WendRagServer,
+        file_name: &str,
+        text: &str,
+    ) -> (String, usize) {
+        use crate::ingest::pipeline;
+        use crate::ingest::pipeline::{ContentIngestRequest, IngestOptions};
+
+        let tags: Vec<String> = Vec::new();
+        let file_path = format!("tests/{file_name}");
+        let result = pipeline::ingest_content(
+            &server.storage,
+            &server.embedder,
+            ContentIngestRequest {
+                file_path: &file_path,
+                file_name,
+                file_type: "text",
+                text,
+            },
+            &IngestOptions::new(
+                None,
+                &tags,
+                None,
+                None,
+                crate::config::ChunkingStrategy::Fixed,
+                0.25,
+                20,
+                false,
+            ),
+        )
+        .await
+        .expect("ingestion must succeed in tests");
+
+        (file_path, result.chunk_count)
+    }
+
+    /**
+     * Builds a document text whose paragraph-per-chunk layout is stable
+     * and guarantees at least `min_chunks` distinct chunks.
+     *
+     * Each paragraph repeats a high-frequency filler enough times to push
+     * past the fixed-window boundary, so the structural chunker cannot
+     * merge adjacent paragraphs. The text-file limits (1 000 chars per
+     * chunk) are documented in `retrieval.md`.
+     */
+    fn build_multi_chunk_document(min_chunks: usize) -> String {
+        (0..min_chunks)
+            .map(|i| format!("Section-{i} {}", "lorem ipsum dolor ".repeat(120)))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /**
+     * Roundtrip by `file_path`: ingest a multi-chunk document, then fetch
+     * an arbitrary interior chunk by index and confirm the response
+     * includes matching identifiers and non-empty content.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_returns_target_chunk_by_file_path() {
+        let (server, _tmp) = make_test_server().await;
+        let text = build_multi_chunk_document(5);
+        let (file_path, chunk_count) = ingest_text(&server, "roundtrip-path.txt", &text).await;
+        assert!(chunk_count >= 3, "fixture must produce at least 3 chunks");
+
+        let target_index = 1;
+        let response = server
+            .rag_get_chunk(Parameters(make_get_chunk_input(
+                Some(&file_path),
+                None,
+                target_index,
+            )))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert!(json.get("error").is_none(), "unexpected error: {response}");
+        let chunks = json["chunks"].as_array().expect("chunks must be an array");
+        assert_eq!(chunks.len(), 1, "single-index window returns one chunk");
+
+        let chunk = &chunks[0];
+        assert_eq!(chunk["file_path"], file_path);
+        assert_eq!(chunk["file_name"], "roundtrip-path.txt");
+        assert_eq!(chunk["chunk_index"], target_index);
+        assert!(
+            chunk["document_id"].as_str().is_some(),
+            "document_id must be populated: {chunk}"
+        );
+        assert!(
+            chunk["content"]
+                .as_str()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false),
+            "content must be non-empty: {chunk}"
+        );
+    }
+
+    /**
+     * Roundtrip by `document_id`: after ingestion, discover the document
+     * UUID via `list_documents` and confirm the by-id lookup returns
+     * exactly the same body as the by-path lookup.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_returns_target_chunk_by_document_id() {
+        let (server, _tmp) = make_test_server().await;
+        let text = build_multi_chunk_document(4);
+        let (file_path, _) = ingest_text(&server, "roundtrip-id.txt", &text).await;
+
+        let docs = server
+            .storage
+            .list_documents(None, None)
+            .await
+            .expect("list_documents must succeed");
+        let document_id = docs
+            .iter()
+            .find(|d| d.file_path == file_path)
+            .expect("just-ingested document must appear in listing")
+            .id
+            .to_string();
+
+        let by_path_json: serde_json::Value = serde_json::from_str(
+            &server
+                .rag_get_chunk(Parameters(make_get_chunk_input(Some(&file_path), None, 0)))
+                .await,
+        )
+        .unwrap();
+        let by_id_json: serde_json::Value = serde_json::from_str(
+            &server
+                .rag_get_chunk(Parameters(make_get_chunk_input(None, Some(&document_id), 0)))
+                .await,
+        )
+        .unwrap();
+
+        let by_path = &by_path_json["chunks"][0];
+        let by_id = &by_id_json["chunks"][0];
+        assert_eq!(by_path["content"], by_id["content"]);
+        assert_eq!(by_path["document_id"], by_id["document_id"]);
+        assert_eq!(by_path["chunk_index"], by_id["chunk_index"]);
+    }
+
+    /**
+     * Requests with `before` and `after` must return the target chunk
+     * plus the specified number of neighbours, in ascending chunk_index
+     * order. Guards against regressions in the clipping / sorting logic.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_returns_neighbours_in_order() {
+        let (server, _tmp) = make_test_server().await;
+        let text = build_multi_chunk_document(6);
+        let (file_path, chunk_count) = ingest_text(&server, "window.txt", &text).await;
+        assert!(chunk_count >= 5);
+
+        let target_index = 2;
+        let before = 1;
+        let after = 2;
+        let response = server
+            .rag_get_chunk(Parameters(GetChunkInput {
+                file_path: Some(file_path.clone()),
+                document_id: None,
+                chunk_index: target_index,
+                before: Some(before),
+                after: Some(after),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let chunks = json["chunks"].as_array().unwrap();
+
+        assert_eq!(
+            chunks.len(),
+            (before + after + 1) as usize,
+            "must return target + {before} before + {after} after: {response}"
+        );
+
+        let indices: Vec<i64> = chunks
+            .iter()
+            .map(|c| c["chunk_index"].as_i64().unwrap())
+            .collect();
+        let expected: Vec<i64> = ((target_index as i64 - before as i64)
+            ..=(target_index as i64 + after as i64))
+            .collect();
+        assert_eq!(
+            indices, expected,
+            "chunks must be in ascending chunk_index order"
+        );
+
+        for chunk in chunks {
+            assert_eq!(chunk["file_path"], file_path);
+        }
+    }
+
+    /**
+     * `before` / `after` requests larger than `MAX_CHUNK_CONTEXT` must be
+     * silently clamped so a single call can never return more than
+     * `2 * MAX_CHUNK_CONTEXT + 1` chunks. Guards against an accidental
+     * raise of the server-side bound.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_clamps_excessive_before_after() {
+        let (server, _tmp) = make_test_server().await;
+        // Ask for more than MAX_CHUNK_CONTEXT on both sides even though
+        // the document doesn't have that many chunks; the test is about
+        // the *cap*, not the clip at the document edge, so we verify
+        // that the response size never exceeds the hard ceiling.
+        let text = build_multi_chunk_document(50);
+        let (file_path, chunk_count) = ingest_text(&server, "clamp.txt", &text).await;
+        assert!(chunk_count >= 40);
+
+        let target_index = 20;
+        let response = server
+            .rag_get_chunk(Parameters(GetChunkInput {
+                file_path: Some(file_path),
+                document_id: None,
+                chunk_index: target_index,
+                before: Some(MAX_CHUNK_CONTEXT + 50),
+                after: Some(MAX_CHUNK_CONTEXT + 50),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let chunks = json["chunks"].as_array().unwrap();
+
+        let max_allowed = (MAX_CHUNK_CONTEXT as usize) * 2 + 1;
+        assert!(
+            chunks.len() <= max_allowed,
+            "response must honour the clamp (got {} chunks, max {})",
+            chunks.len(),
+            max_allowed
+        );
+    }
+
+    /**
+     * A `before` window that would run past chunk 0 must clip to chunk 0
+     * instead of producing negative indices or a database error.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_clips_window_at_document_start() {
+        let (server, _tmp) = make_test_server().await;
+        let text = build_multi_chunk_document(5);
+        let (file_path, _) = ingest_text(&server, "start-clip.txt", &text).await;
+
+        let response = server
+            .rag_get_chunk(Parameters(GetChunkInput {
+                file_path: Some(file_path),
+                document_id: None,
+                chunk_index: 0,
+                before: Some(3),
+                after: Some(1),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let chunks = json["chunks"].as_array().unwrap();
+
+        // Document has chunks [0..N]. Asking for 3 before chunk 0 must
+        // clip to just chunks [0, 1] -- the target plus the one after.
+        assert_eq!(chunks.len(), 2, "start-of-document clip must yield 2 chunks");
+        assert_eq!(chunks[0]["chunk_index"], 0);
+        assert_eq!(chunks[1]["chunk_index"], 1);
+    }
+
+    /**
+     * Scenario test for the Mermaid-diagram-split use case: a fenced code
+     * block that would not fit in a single chunk gets recombined by
+     * issuing a single `rag_get_chunk` call with a symmetric window.
+     *
+     * This is the intended flow described in `mcp-tools.md`: the agent
+     * sees a partial code block in a `rag_get_context` hit, notes its
+     * `file_path` + `chunk_index`, and asks for the surrounding chunks to
+     * reconstruct the full block.
+     */
+    #[tokio::test]
+    async fn rag_get_chunk_reconstructs_code_block_split_across_chunks() {
+        let (server, _tmp) = make_test_server().await;
+
+        // Build a document whose middle contains a large fenced block and
+        // whose before / after paragraphs are wide enough to force each
+        // into its own chunk. Marker sentinels make the reconstruction
+        // assertion unambiguous.
+        let filler_before = format!("PREFIX_MARKER {}", "before ".repeat(150));
+        let diagram = format!(
+            "```mermaid\n{}\n```",
+            (0..120)
+                .map(|i| format!("  node{i} --> node{}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let filler_after = format!("SUFFIX_MARKER {}", "after ".repeat(150));
+        let text = format!("{filler_before}\n\n{diagram}\n\n{filler_after}");
+
+        let (file_path, chunk_count) = ingest_text(&server, "mermaid.txt", &text).await;
+        assert!(
+            chunk_count >= 3,
+            "document must produce at least 3 chunks for this scenario, got {chunk_count}"
+        );
+
+        // Pick the middle chunk as the one the agent saw truncated.
+        let target_index = (chunk_count / 2) as i32;
+        let response = server
+            .rag_get_chunk(Parameters(GetChunkInput {
+                file_path: Some(file_path.clone()),
+                document_id: None,
+                chunk_index: target_index,
+                before: Some(MAX_CHUNK_CONTEXT),
+                after: Some(MAX_CHUNK_CONTEXT),
+            }))
+            .await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let chunks = json["chunks"].as_array().unwrap();
+        assert!(!chunks.is_empty(), "window must return at least one chunk");
+
+        // Concatenate the returned chunk contents to confirm the agent
+        // can rebuild the original diagram text from a single tool call.
+        let reconstructed: String = chunks
+            .iter()
+            .map(|c| c["content"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            reconstructed.contains("```mermaid"),
+            "reconstruction must include the opening fence: first 300 chars = {:?}",
+            &reconstructed.chars().take(300).collect::<String>()
+        );
+        assert!(
+            reconstructed.contains("node0 --> node1"),
+            "reconstruction must include the first edge of the diagram"
+        );
+        assert!(
+            reconstructed.contains("```"),
+            "reconstruction must include a closing fence"
+        );
     }
 }

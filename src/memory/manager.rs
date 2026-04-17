@@ -1,4 +1,4 @@
-/**
+/*!
  * Memory manager — main orchestrator for the memory subsystem.
  *
  * Coordinates session buffers (in-memory), persistent long-term storage,
@@ -18,9 +18,9 @@ use crate::memory::{
     MemoryScope,
     buffer::{SessionBuffer, SessionConfig, SessionContext},
     calculate_decayed_importance,
-    retrieval::{MemoryContext, MemoryRetriever, build_memory_context},
+    retrieval::MemoryRetriever,
     storage::{MemoryStorage, MemoryStorageError},
-    types::{ChatMessage, MemoryEntry, MemoryType, MessageRole},
+    types::{MemoryEntry, MemoryType},
 };
 
 #[derive(Debug, Clone)]
@@ -52,22 +52,6 @@ impl Default for MemoryConfig {
     }
 }
 
-impl MemoryConfig {
-    pub fn minimal() -> Self {
-        Self {
-            enabled: true,
-            session: SessionConfig::minimal(),
-            default_importance: 0.5,
-            decay_rate: 0.05,
-            prune_threshold: 0.2,
-            consolidation_interval_hours: 1,
-            session_timeout_seconds: 60,
-            max_memories_per_query: 5,
-            recency_weight: 0.3,
-        }
-    }
-}
-
 pub struct MemoryManager {
     config: MemoryConfig,
     storage: Arc<dyn MemoryStorage>,
@@ -92,38 +76,6 @@ impl MemoryManager {
         }
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
-    pub fn config(&self) -> &MemoryConfig {
-        &self.config
-    }
-
-    async fn with_session_buffer<F, R>(
-        &self,
-        session_id: &str,
-        f: F,
-    ) -> Result<R, MemoryStorageError>
-    where
-        F: FnOnce(&mut SessionBuffer) -> R,
-    {
-        if !self.session_buffers.contains_key(session_id) {
-            let buffer = SessionBuffer::new(session_id, self.config.session.clone());
-            self.session_buffers
-                .insert(session_id.to_string(), RwLock::new(buffer));
-            tracing::info!(session_id, "created new session buffer");
-        }
-
-        let entry = self
-            .session_buffers
-            .get(session_id)
-            .ok_or_else(|| MemoryStorageError::NotFound(Uuid::new_v4()))?;
-
-        let mut guard = entry.value().write().await;
-        Ok(f(&mut guard))
-    }
-
     pub async fn get_session_context(&self, session_id: &str) -> Option<SessionContext> {
         self.session_buffers.get(session_id).and_then(|entry| {
             entry
@@ -132,37 +84,6 @@ impl MemoryManager {
                 .ok()
                 .map(|guard| guard.get_context())
         })
-    }
-
-    /**
-     * Adds a message to a session buffer and returns whether the buffer
-     * is full (caller may want to trigger summarization).
-     */
-    pub async fn add_session_message(
-        &self,
-        session_id: &str,
-        role: MessageRole,
-        content: impl Into<String>,
-    ) -> Result<bool, MemoryStorageError> {
-        let content_str = content.into();
-        self.with_session_buffer(session_id, |buffer| {
-            buffer.add_message(ChatMessage::new(role, content_str));
-            buffer.apply_sliding_window();
-            buffer.message_count() >= buffer.config.max_messages
-        })
-        .await
-    }
-
-    pub async fn summarize_session(
-        &self,
-        session_id: &str,
-        summary: impl Into<String>,
-    ) -> Result<(), MemoryStorageError> {
-        let summary_str = summary.into();
-        self.with_session_buffer(session_id, |buffer| {
-            buffer.summarize(summary_str);
-        })
-        .await
     }
 
     pub async fn end_session(
@@ -216,10 +137,10 @@ impl MemoryManager {
     pub async fn cleanup_expired_sessions(&self) -> usize {
         let mut expired = Vec::new();
         for entry in self.session_buffers.iter() {
-            if let Ok(buffer) = entry.value().try_read() {
-                if buffer.is_expired(self.config.session_timeout_seconds) {
-                    expired.push(entry.key().clone());
-                }
+            if let Ok(buffer) = entry.value().try_read()
+                && buffer.is_expired(self.config.session_timeout_seconds)
+            {
+                expired.push(entry.key().clone());
             }
         }
 
@@ -256,7 +177,7 @@ impl MemoryManager {
 
         let embedding = self
             .embedder
-            .embed(&[content_str.clone()])
+            .embed(std::slice::from_ref(&content_str))
             .await
             .ok()
             .and_then(|mut v| v.pop());
@@ -276,57 +197,12 @@ impl MemoryManager {
         Ok(entry)
     }
 
-    pub async fn get_memory(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<MemoryEntry>, MemoryStorageError> {
-        self.storage.get_memory(id).await
-    }
-
     pub async fn delete_memory(&self, id: Uuid) -> Result<bool, MemoryStorageError> {
         self.storage.delete_memory(id).await
     }
 
     pub async fn invalidate_memory(&self, id: Uuid) -> Result<bool, MemoryStorageError> {
         self.storage.invalidate_memory(id).await
-    }
-
-    /**
-     * Builds comprehensive context from session buffer + long-term memory
-     * for injection into an LLM prompt.
-     */
-    pub async fn build_context(
-        &self,
-        query: &str,
-        session_id: Option<&str>,
-        user_id: Option<&str>,
-    ) -> Result<MemoryContext, MemoryStorageError> {
-        let session_buffer = if let Some(sid) = session_id {
-            self.session_buffers.get(sid).and_then(|entry| {
-                entry.value().try_read().ok().map(|guard| {
-                    let ctx = guard.get_context_window();
-                    (ctx.summary, ctx.recent_messages)
-                })
-            })
-        } else {
-            None
-        };
-
-        let (summary, recent) = session_buffer.unwrap_or((None, Vec::new()));
-
-        let context = build_memory_context(
-            summary,
-            recent,
-            Arc::clone(&self.storage),
-            query,
-            user_id,
-            &self.retriever,
-            self.config.max_memories_per_query,
-            self.config.recency_weight,
-        )
-        .await?;
-
-        Ok(context)
     }
 
     pub async fn retrieve_memories(

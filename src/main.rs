@@ -1,7 +1,17 @@
+use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use axum::response::IntoResponse;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{self as axum_middleware, Next};
+use axum::response::{IntoResponse, Response};
 use clap::{Parser, Subcommand};
+use rmcp::ServiceExt;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
+use wend_rag::auth::{Authenticator, KeyStore, default_keys_path};
 use wend_rag::config::{Config, EmbeddingProviderKind, StorageBackendKind};
 use wend_rag::config_file::FileConfig;
 use wend_rag::embed::{self, OllamaProvider, OpenAiCompatProvider};
@@ -12,10 +22,6 @@ use wend_rag::memory;
 use wend_rag::observability;
 use wend_rag::rerank::{self, RerankerProvider};
 use wend_rag::store;
-use rmcp::ServiceExt;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
 
 #[derive(Parser)]
 #[command(name = "wend-rag", version, about = "wendRAG — RAG-powered MCP server")]
@@ -39,6 +45,26 @@ enum Command {
     },
     /// Start the MCP server over stdio transport
     Stdio,
+    /// Generate a new API key for HTTP transport authentication.
+    /// Prompts for a human-readable name, then prints the raw key exactly
+    /// once. Only a SHA-256 hash is persisted to disk.
+    #[command(name = "key:generate")]
+    KeyGenerate {
+        /// Optional key name. When omitted, the command prompts interactively.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List registered API keys by name, display prefix, and creation time.
+    /// The underlying keys are never shown; only their non-sensitive metadata.
+    #[command(name = "key:list")]
+    KeyList,
+    /// Revoke an API key by name. Once revoked the key's hash is removed and
+    /// any client still presenting it will receive 401 Unauthorized.
+    #[command(name = "key:revoke")]
+    KeyRevoke {
+        /// Name of the key to revoke. When omitted, the command prompts.
+        name: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -47,6 +73,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     observability::init_tracing();
 
     let cli = Cli::parse();
+
+    // Key management commands intentionally skip the full runtime bootstrap
+    // (storage, embedder, memory) so operators can manage keys on a host
+    // that doesn't have the data plane configured yet.
+    match cli.command {
+        Command::KeyGenerate { name } => return run_key_generate(name),
+        Command::KeyList => return run_key_list(),
+        Command::KeyRevoke { name } => return run_key_revoke(name),
+        _ => {}
+    }
 
     let file_config = FileConfig::load(cli.config.as_deref());
     let cfg = Config::load(file_config.as_ref())?;
@@ -63,6 +99,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Stdio => {
             tracing::info!("starting wendRAG MCP server (stdio)")
+        }
+        Command::KeyGenerate { .. } | Command::KeyList | Command::KeyRevoke { .. } => {
+            unreachable!("key subcommands are dispatched above")
         }
     }
 
@@ -149,8 +188,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 memory::maintenance::spawn_maintenance_task(Arc::clone(mm), interval);
             }
+            let authenticator = Arc::new(Authenticator::from_environment()?);
             let server = build_server(cfg, storage, embedder, entity_extractor, reranker, memory_manager);
-            serve_http(server, &host, port).await
+            serve_http(server, &host, port, authenticator).await
         }
         Command::Stdio => {
             if let Some(ref mm) = memory_manager {
@@ -161,6 +201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let server = build_server(cfg, storage, embedder, entity_extractor, reranker, memory_manager);
             serve_stdio(server).await
+        }
+        Command::KeyGenerate { .. } | Command::KeyList | Command::KeyRevoke { .. } => {
+            unreachable!("key subcommands are dispatched above")
         }
     }
 }
@@ -235,6 +278,7 @@ fn build_server(
  * so shell users can inspect or pipe the result. Logs per-file progress and an
  * aggregate summary to stderr. Supports local paths and HTTP(S) URLs.
  */
+#[allow(clippy::too_many_arguments)]
 async fn run_cli_ingest(
     storage: &Arc<dyn store::StorageBackend>,
     embedder: &Arc<dyn embed::EmbeddingProvider>,
@@ -278,11 +322,18 @@ async fn run_cli_ingest(
  * Binds an Axum router on `host:port` with the MCP endpoint at `/mcp` and a
  * plain `/health` endpoint for systemd, load-balancers, and container probes.
  * Listens for SIGTERM / ctrl_c and drains in-flight requests before exiting.
+ *
+ * When `authenticator.is_auth_required()` returns true, all requests to
+ * `/mcp` must carry an `Authorization: Bearer <token>` header matching one
+ * of the registered keys (either from `WEND_RAG_API_KEY` or the keys file).
+ * The `/health` endpoint is intentionally left unauthenticated so probes
+ * do not need to carry credentials.
  */
 async fn serve_http(
     server: WendRagServer,
     host: &str,
     port: u16,
+    authenticator: Arc<Authenticator>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = format!("{host}:{port}");
     tracing::info!(addr = %bind_addr, "MCP Streamable HTTP server listening at /mcp");
@@ -294,9 +345,26 @@ async fn serve_http(
             StreamableHttpServerConfig::default(),
         );
 
+    let mut mcp_router = axum::Router::new().nest_service("/mcp", service);
+    if authenticator.is_auth_required() {
+        tracing::info!(
+            key_count = authenticator.key_count(),
+            "API key authentication enabled on /mcp"
+        );
+        mcp_router = mcp_router.layer(axum_middleware::from_fn_with_state(
+            authenticator.clone(),
+            auth_middleware,
+        ));
+    } else {
+        tracing::warn!(
+            "API key authentication DISABLED -- /mcp accepts unauthenticated requests. \
+             Run `wend-rag key:generate` or set WEND_RAG_API_KEY to enable."
+        );
+    }
+
     let router = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
-        .nest_service("/mcp", service);
+        .merge(mcp_router);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
@@ -304,6 +372,35 @@ async fn serve_http(
 
     tracing::info!("server shut down gracefully");
     Ok(())
+}
+
+/**
+ * Axum middleware that enforces Bearer token authentication on protected
+ * routes. Extracts the `Authorization` header, strips the `Bearer ` prefix,
+ * and defers to [`Authenticator::validate`] for constant-time comparison.
+ *
+ * Returns 401 Unauthorized on any mismatch or missing header.
+ */
+async fn auth_middleware(
+    State(auth): State<Arc<Authenticator>>,
+    headers: HeaderMap,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let token = headers
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+
+    match token {
+        Some(presented) if auth.validate(presented) => Ok(next.run(request).await),
+        _ => {
+            tracing::warn!("rejecting request to /mcp: missing or invalid bearer token");
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
 }
 
 /**
@@ -359,4 +456,107 @@ async fn serve_stdio(server: WendRagServer) -> Result<(), Box<dyn std::error::Er
 
     tracing::info!("MCP stdio server shut down");
     Ok(())
+}
+
+/**
+ * Runs the `key:generate` subcommand.
+ *
+ * When `name` is `None` the command prompts interactively on stdout/stdin
+ * so operators can use it ad-hoc. The generated key is printed to stdout
+ * exactly once; only its SHA-256 hash is persisted.
+ */
+fn run_key_generate(name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let name = match name {
+        Some(n) => n,
+        None => prompt_line("Enter key name: ")?,
+    };
+
+    let mut store = KeyStore::load_default()?;
+    println!("Generating...\n");
+    let raw = store.add_key(&name)?;
+    store.save_default()?;
+
+    let stored = store
+        .keys()
+        .iter()
+        .find(|k| k.name == name.trim())
+        .expect("just-added key must be present");
+
+    let path = default_keys_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unset>".to_string());
+
+    println!("Key Created");
+    println!();
+    println!("Name:       {}", stored.name);
+    println!("Key:        {raw}");
+    println!("Prefix:     {}", stored.key_prefix);
+    println!("Created at: {}", stored.created_at.to_rfc3339());
+    println!("Stored in:  {path}");
+    println!();
+    println!("Keep this key safe -- it will not be shown again.");
+    println!(
+        "Use it with MCP clients by setting `Authorization: Bearer {}` on /mcp.",
+        stored.key_prefix,
+    );
+    Ok(())
+}
+
+/**
+ * Runs the `key:list` subcommand. Prints each registered key's non-sensitive
+ * metadata (name, display prefix, creation time).
+ */
+fn run_key_list() -> Result<(), Box<dyn std::error::Error>> {
+    let store = KeyStore::load_default()?;
+    if store.is_empty() {
+        println!("No keys registered.");
+        if let Some(path) = default_keys_path() {
+            println!("Keys file: {}", path.display());
+        }
+        println!("Run `wend-rag key:generate` to create one.");
+        return Ok(());
+    }
+
+    println!("{:<24} {:<20} CREATED", "NAME", "PREFIX");
+    for key in store.keys() {
+        println!(
+            "{:<24} {:<20} {}",
+            key.name,
+            key.key_prefix,
+            key.created_at.to_rfc3339()
+        );
+    }
+    Ok(())
+}
+
+/**
+ * Runs the `key:revoke` subcommand. Removes the named key's hash from the
+ * store; subsequent requests presenting that key will receive 401.
+ */
+fn run_key_revoke(name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let name = match name {
+        Some(n) => n,
+        None => prompt_line("Name of the key to revoke: ")?,
+    };
+
+    let mut store = KeyStore::load_default()?;
+    store.revoke(&name)?;
+    store.save_default()?;
+
+    println!("Key '{}' revoked.", name.trim());
+    Ok(())
+}
+
+/**
+ * Reads a single line from stdin after writing a prompt to stdout. The
+ * returned string has leading/trailing whitespace stripped so interactive
+ * use is ergonomic.
+ */
+fn prompt_line(prompt: &str) -> io::Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }

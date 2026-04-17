@@ -1,4 +1,4 @@
-/**
+/*!
  * Community persistence for the SQLite backend.
  *
  * Stores community embeddings as BLOBs and computes cosine similarity in Rust
@@ -56,14 +56,20 @@ pub(crate) async fn save_communities(
 
         let entity_ids = resolve_entity_ids(&mut tx, &community.community.entity_ids).await?;
 
-        for entity_id in &entity_ids {
-            sqlx::query(
-                "INSERT INTO community_members (community_id, entity_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
-            )
-            .bind(&community_id)
-            .bind(entity_id)
-            .execute(&mut *tx)
-            .await?;
+        // PERF-02: batch community_members inserts with multi-row INSERT.
+        /// Rows per batch. 2 params per row stays well below SQLite's
+        /// default parameter limit of 999.
+        const MEMBER_BATCH_SIZE: usize = 100;
+
+        for batch in entity_ids.chunks(MEMBER_BATCH_SIZE) {
+            let mut builder = sqlx::QueryBuilder::new(
+                "INSERT INTO community_members (community_id, entity_id) ",
+            );
+            builder.push_values(batch, |mut row, entity_id| {
+                row.push_bind(&community_id).push_bind(entity_id);
+            });
+            builder.push(" ON CONFLICT DO NOTHING");
+            builder.build().execute(&mut *tx).await?;
         }
     }
 

@@ -17,6 +17,9 @@ When running with Cargo, pass subcommands after `--` so they are not consumed by
 | `daemon` | Start the MCP server over Streamable HTTP. |
 | `stdio` | Start the MCP server over stdio transport. |
 | `ingest <path>` | One-shot ingestion of a file, directory, or HTTP(S) URL, then exit. |
+| `key:generate` | Generate a new API key for the HTTP transport. Prompts for a name. |
+| `key:list` | List registered API keys by name, display prefix, and creation time. |
+| `key:revoke [name]` | Revoke an API key. Prompts for the name if not supplied. |
 
 ## Examples
 
@@ -35,7 +38,47 @@ cargo run -- ingest path/to/docs/
 
 # Ingest a remote URL
 cargo run -- ingest https://example.com/article
+
+# Generate an API key (interactive)
+cargo run -- key:generate
+# or non-interactive for scripts:
+cargo run -- key:generate --name ci-runner
+
+# List existing keys (names and non-sensitive metadata only)
+cargo run -- key:list
+
+# Revoke a key
+cargo run -- key:revoke ci-runner
 ```
+
+## API key management
+
+The `key:*` subcommands manage the Bearer tokens used by the HTTP
+transport. Keys are stored as SHA-256 hashes in a local JSON file; the
+raw key is displayed exactly once at generation time.
+
+Interactive `key:generate` example:
+
+```text
+$ wend-rag key:generate
+Enter key name: RaymonKey
+Generating...
+
+Key Created
+
+Name:       RaymonKey
+Key:        wrag_8f3a2c1e9b4d7a6c5f8e1d3b9a2c4e7f1d8b3a6c9e2f5d8b1a4c7e0f3d6b9a2c
+Prefix:     wrag_8f3a2c1e
+Created at: 2026-04-17T18:42:15+00:00
+Stored in:  /home/user/.wend-rag/keys.json
+
+Keep this key safe -- it will not be shown again.
+```
+
+See [authentication-setup.md](authentication-setup.md) for the full
+authentication guide (threat model, revocation, env-var fallback, and
+client setup). Key commands never touch the database or embedder, so
+they work on a fresh host that has not yet been configured for ingest.
 
 ### One-shot ingestion with Docker Compose
 

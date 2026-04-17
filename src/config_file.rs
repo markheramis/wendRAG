@@ -182,10 +182,10 @@ impl FileConfig {
             return Some(PathBuf::from(p));
         }
 
-        if let Ok(p) = std::env::var("WEND_RAG_CONFIG") {
-            if !p.is_empty() {
-                return Some(PathBuf::from(p));
-            }
+        if let Ok(p) = std::env::var("WEND_RAG_CONFIG")
+            && !p.is_empty()
+        {
+            return Some(PathBuf::from(p));
         }
 
         #[cfg(target_os = "linux")]

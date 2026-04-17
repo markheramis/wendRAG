@@ -1,4 +1,4 @@
-/**
+/*!
  * Community-augmented retrieval branch for the RRF fusion pipeline.
  *
  * Performs two-tier retrieval (local + global) through the storage layer and

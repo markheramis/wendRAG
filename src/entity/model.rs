@@ -1,4 +1,4 @@
-/**
+/*!
  * Domain types, error enums, and the entity extractor trait used across the
  * ingestion pipeline, storage backends, and retrieval layers.
  */

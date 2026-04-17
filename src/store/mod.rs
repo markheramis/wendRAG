@@ -89,11 +89,18 @@ pub trait StorageBackend: Send + Sync {
      * Persists the optional entity graph derived from a document's chunks after
      * chunk replacement has completed. Backends without graph support may ignore
      * the payload.
+     *
+     * The graph is passed by `&mut` so backends can move expensive owned
+     * data (notably per-entity embedding `Vec<f32>` allocations) out of the
+     * graph into the INSERT bind slots without cloning. Callers must not
+     * rely on the embeddings still being present after this call returns;
+     * every other field (entities, mentions, relationships, names) remains
+     * intact so community analysis can still run on the same `graph`.
      */
     async fn replace_document_entity_graph(
         &self,
         _document_id: Uuid,
-        _graph: &DocumentEntityGraph,
+        _graph: &mut DocumentEntityGraph,
     ) -> Result<(), sqlx::Error> {
         Ok(())
     }
@@ -154,13 +161,32 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<Vec<models::DocumentWithChunkCount>, sqlx::Error>;
 
     /**
-     * Loads every stored chunk for a document path in ascending chunk order so
-     * higher layers can reconstruct full-document context responses.
+     * Loads every stored chunk for a document path in ascending chunk
+     * order. Powers the `rag://documents/{id}` MCP resource view.
      */
     async fn get_document_chunks(
         &self,
         file_path: &str,
     ) -> Result<Vec<models::DocumentChunk>, sqlx::Error>;
+
+    /**
+     * Loads an inclusive, ascending range of chunks from a single document.
+     *
+     * Selector: exactly one of `file_path` or `document_id` must be `Some`.
+     * Passing both or neither yields an empty result set so callers can
+     * validate their arguments before querying.
+     *
+     * The returned slice includes every stored chunk whose `chunk_index`
+     * satisfies `start_index <= chunk_index <= end_index`. Indices outside
+     * the document's actual range are silently clipped.
+     */
+    async fn get_chunks_by_index(
+        &self,
+        file_path: Option<&str>,
+        document_id: Option<Uuid>,
+        start_index: i32,
+        end_index: i32,
+    ) -> Result<Vec<models::DocumentChunkWithMeta>, sqlx::Error>;
 
     /**
      * Deletes a document selected by path or identifier and reports the removed

@@ -1,4 +1,4 @@
-/**
+/*!
  * FTS5 query building, LIKE escaping, and trigram similarity scoring used by
  * the SQLite sparse retrieval branches.
  */

@@ -49,28 +49,37 @@ pub async fn search(
     if graph_settings.enabled {
         let seed_results = fusion::reciprocal_rank_fusion(&branches, top_k as usize);
         let seed_chunk_ids: Vec<_> = seed_results.iter().map(|c| c.chunk_id).collect();
-        let graph_results = storage
-            .search_graph(
-                &seed_chunk_ids,
-                top_k,
-                filters,
-                graph_settings.traversal_depth,
-            )
-            .await?;
-        if !graph_results.is_empty() {
-            branches.push(graph_results);
-        }
 
-        let community_results = community::search(
+        // PERF-05: graph search and community search are independent
+        // (they both build on the same seed chunks but hit different
+        // backend queries). Running them in parallel halves the
+        // post-fusion latency when both branches have work to do.
+        //
+        // Community search is best-effort -- treat any error as an empty
+        // result set so a community-index failure never blocks the
+        // primary retrieval path.
+        let graph_future = storage.search_graph(
+            &seed_chunk_ids,
+            top_k,
+            filters,
+            graph_settings.traversal_depth,
+        );
+        let community_future = community::search(
             storage,
             &dense_embedding,
             &seed_chunk_ids,
             top_k,
             filters,
             graph_settings.traversal_depth,
-        )
-        .await
-        .unwrap_or_default();
+        );
+
+        let (graph_results, community_results) = tokio::join!(graph_future, community_future);
+        let graph_results = graph_results?;
+        let community_results = community_results.unwrap_or_default();
+
+        if !graph_results.is_empty() {
+            branches.push(graph_results);
+        }
         if !community_results.is_empty() {
             branches.push(community_results);
         }

@@ -1,4 +1,4 @@
-/**
+/*!
  * Document chunking orchestration: selects the section extraction strategy
  * based on file type and routes oversized sections to semantic or fixed-window
  * splitting.
@@ -156,19 +156,19 @@ const GARBAGE_PATTERNS: &[&str] = &[
  * Splits into sentences, filters out garbage sentences, and rejoins.
  */
 fn filter_garbage_from_text(text: &str) -> String {
-    let sentences: Vec<&str> = text.split(|c| matches!(c, '.' | '!' | '?')).collect();
+    let sentences: Vec<&str> = text.split(['.', '!', '?']).collect();
     let mut filtered = Vec::new();
-    
+
     for sentence in sentences {
         let trimmed = sentence.trim();
         if trimmed.is_empty() {
             continue;
         }
-        
+
         let len = trimmed.len();
-        
+
         // Filter by length
-        if len < MIN_SENTENCE_LENGTH || len > MAX_SENTENCE_LENGTH {
+        if !(MIN_SENTENCE_LENGTH..=MAX_SENTENCE_LENGTH).contains(&len) {
             continue;
         }
         

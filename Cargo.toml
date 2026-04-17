@@ -1,6 +1,6 @@
 [package]
 name = "wend-rag"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -36,6 +36,8 @@ serde_yml = "0.0.12"
 glob = "0.3"
 async-trait = "0.1"
 thiserror = "2"
+getrandom = "0.2"
+dirs = "5"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

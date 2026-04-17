@@ -1,4 +1,4 @@
-/**
+/*!
  * PostgreSQL storage backend: struct definition, connection, document CRUD,
  * and trait implementation that delegates search and entity graph operations
  * to focused submodules.
@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::entity::{CommunityWithSummary, DocumentEntityGraph};
 use crate::retrieve::ScoredChunk;
-use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount, StoredCommunity};
+use crate::store::models::{
+    Document, DocumentChunk, DocumentChunkWithMeta, DocumentWithChunkCount, StoredCommunity,
+};
 
 use crate::config::PoolConfig;
 
@@ -130,7 +132,7 @@ impl StorageBackend for PostgresBackend {
     async fn replace_document_entity_graph(
         &self,
         document_id: Uuid,
-        graph: &DocumentEntityGraph,
+        graph: &mut DocumentEntityGraph,
     ) -> Result<(), sqlx::Error> {
         entity_graph::replace_document_entity_graph(&self.pool, document_id, graph).await
     }
@@ -205,6 +207,49 @@ impl StorageBackend for PostgresBackend {
             "#,
         )
         .bind(file_path)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    async fn get_chunks_by_index(
+        &self,
+        file_path: Option<&str>,
+        document_id: Option<Uuid>,
+        start_index: i32,
+        end_index: i32,
+    ) -> Result<Vec<DocumentChunkWithMeta>, sqlx::Error> {
+        // Contract: callers must supply exactly one selector. Returning an
+        // empty slice (rather than erroring) keeps the behaviour uniform
+        // with the trait docstring and lets the MCP handler surface a
+        // friendly error instead of a backend exception.
+        if file_path.is_some() == document_id.is_some() {
+            return Ok(Vec::new());
+        }
+        if end_index < start_index {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as::<_, DocumentChunkWithMeta>(
+            r#"
+            SELECT
+                d.id          AS document_id,
+                d.file_path   AS file_path,
+                d.file_name   AS file_name,
+                c.chunk_index AS chunk_index,
+                c.section_title AS section_title,
+                c.content     AS content
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE ($1::text IS NULL OR d.file_path = $1)
+              AND ($2::uuid IS NULL OR d.id = $2)
+              AND c.chunk_index BETWEEN $3 AND $4
+            ORDER BY c.chunk_index ASC
+            "#,
+        )
+        .bind(file_path)
+        .bind(document_id)
+        .bind(start_index)
+        .bind(end_index)
         .fetch_all(&self.pool)
         .await
     }

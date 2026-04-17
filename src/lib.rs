@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod config_file;
 pub mod embed;

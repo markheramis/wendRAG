@@ -1,4 +1,4 @@
-/**
+/*!
  * Memory / Session Layer for Agent-Oriented RAG
  *
  * Implements a three-tier memory system:

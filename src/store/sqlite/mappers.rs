@@ -1,4 +1,4 @@
-/**
+/*!
  * Row-to-model mapping functions and codec helpers for the SQLite backend.
  */
 
@@ -8,7 +8,9 @@ use sqlx::sqlite::SqliteRow;
 use uuid::Uuid;
 
 use crate::retrieve::ScoredChunk;
-use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount};
+use crate::store::models::{
+    Document, DocumentChunk, DocumentChunkWithMeta, DocumentWithChunkCount,
+};
 
 /**
  * Converts a JSON string column into the tag list used by the public models.
@@ -73,14 +75,34 @@ pub(crate) fn map_document_with_chunk_count_row(
 }
 
 /**
- * Maps the ordered full-context chunk projection from SQLite row data into the
- * shared model.
+ * Maps an ordered chunk projection from SQLite row data into the shared
+ * `DocumentChunk` model. Used by `get_document_chunks`, which powers the
+ * `rag://documents/{id}` MCP resource view.
  */
 pub(crate) fn map_document_chunk_row(row: SqliteRow) -> Result<DocumentChunk, sqlx::Error> {
     Ok(DocumentChunk {
         content: row.try_get("content")?,
         chunk_index: row.try_get("chunk_index")?,
         section_title: row.try_get("section_title")?,
+    })
+}
+
+/**
+ * Maps the chunk-with-metadata projection used by
+ * [`crate::store::StorageBackend::get_chunks_by_index`]. SQLite stores both
+ * `documents.id` and `chunks.id` as TEXT, so the document UUID is parsed
+ * back into a `Uuid` here rather than by `sqlx::FromRow`.
+ */
+pub(crate) fn map_document_chunk_with_meta_row(
+    row: SqliteRow,
+) -> Result<DocumentChunkWithMeta, sqlx::Error> {
+    Ok(DocumentChunkWithMeta {
+        document_id: parse_uuid_text(row.try_get("document_id")?)?,
+        file_path: row.try_get("file_path")?,
+        file_name: row.try_get("file_name")?,
+        chunk_index: row.try_get("chunk_index")?,
+        section_title: row.try_get("section_title")?,
+        content: row.try_get("content")?,
     })
 }
 

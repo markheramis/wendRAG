@@ -1,4 +1,4 @@
-/**
+/*!
  * Shared types, error enums, and configuration structs used across the
  * single-file, directory, and inline-content ingestion flows.
  */
@@ -93,7 +93,12 @@ impl IngestOptions {
     /**
      * Captures the shared ingest options passed through file, directory, and
      * inline-content ingestion flows.
+     *
+     * The wide argument list is intentional: `IngestOptions` is the single
+     * place where every ingest-time tunable is aggregated. Splitting this
+     * constructor into a builder would just move the same fields around.
      */
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project: Option<&str>,
         tags: &[String],

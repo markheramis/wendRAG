@@ -1,4 +1,4 @@
-/**
+/*!
  * SQLite implementation of the MemoryStorage trait.
  *
  * Stores embeddings as BLOBs and computes cosine similarity in Rust

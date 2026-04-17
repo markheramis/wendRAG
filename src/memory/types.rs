@@ -1,4 +1,4 @@
-/**
+/*!
  * Core types for the memory subsystem.
  *
  * Defines data structures for memory entries, session messages,
@@ -310,22 +310,6 @@ impl MemoryQuery {
      */
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
-        self
-    }
-
-    /**
-     * Set the minimum importance filter.
-     */
-    pub fn min_importance(mut self, min_importance: f32) -> Self {
-        self.min_importance = Some(min_importance);
-        self
-    }
-
-    /**
-     * Set the entry type filter.
-     */
-    pub fn entry_type(mut self, entry_type: MemoryType) -> Self {
-        self.entry_type = Some(entry_type);
         self
     }
 

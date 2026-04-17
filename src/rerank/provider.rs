@@ -1,4 +1,4 @@
-/**
+/*!
  * Reranker provider trait and shared types.
  *
  * Defines the async interface that all reranking backends (Cohere, Jina,

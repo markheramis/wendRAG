@@ -1,4 +1,4 @@
-/**
+/*!
  * Entity graph persistence and orphan pruning for the SQLite backend.
  */
 
@@ -21,7 +21,7 @@ use super::embeddings::embedding_to_blob;
 pub(crate) async fn replace_document_entity_graph(
     pool: &SqlitePool,
     document_id: Uuid,
-    graph: &DocumentEntityGraph,
+    graph: &mut DocumentEntityGraph,
 ) -> Result<(), sqlx::Error> {
     if graph.is_empty() {
         let mut tx = pool.begin().await?;
@@ -53,13 +53,17 @@ pub(crate) async fn replace_document_entity_graph(
     let mut entity_ids_by_key: HashMap<(String, String), String> = HashMap::new();
     let now = Utc::now().to_rfc3339();
 
+    // SQLite already passes `&entity.embedding` to `embedding_to_blob` without
+    // an intermediate clone, so no `mem::take` is needed here -- the `&mut`
+    // receiver exists only to match the updated `StorageBackend` trait
+    // signature introduced for the Postgres optimisation.
     for entity in &graph.entities {
         let new_id = Uuid::new_v4().to_string();
-        let embedding_blob = entity
-            .embedding
-            .is_empty()
-            .then(|| None)
-            .unwrap_or_else(|| Some(embedding_to_blob(&entity.embedding)));
+        let embedding_blob = if entity.embedding.is_empty() {
+            None
+        } else {
+            Some(embedding_to_blob(&entity.embedding))
+        };
 
         let row = sqlx::query(
             r#"
@@ -99,71 +103,91 @@ pub(crate) async fn replace_document_entity_graph(
         );
     }
 
-    for mention in &graph.mentions {
-        let Some(chunk_id) = chunk_ids_by_index.get(&mention.chunk_index) else {
-            continue;
-        };
-        let Some(entity_id) = entity_ids_by_key
-            .get(&(mention.normalized_name.clone(), mention.entity_type.clone()))
-        else {
-            continue;
-        };
+    // PERF-02: batch mentions and relationships with multi-row INSERTs
+    // mirroring the Postgres backend's `QueryBuilder::push_values` pattern.
+    /// Rows per multi-row INSERT batch. Stays comfortably below SQLite's
+    /// default `SQLITE_LIMIT_VARIABLE_NUMBER = 999` parameter cap even at
+    /// 8 params per row (relationships) x 50 rows = 400 parameters.
+    const BATCH_SIZE: usize = 50;
 
-        sqlx::query(
-            r#"
-            INSERT INTO entity_mentions (chunk_id, entity_id)
-            VALUES (?, ?)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(chunk_id)
-        .bind(entity_id)
-        .execute(&mut *tx)
-        .await?;
+    let resolved_mentions: Vec<(String, String)> = graph
+        .mentions
+        .iter()
+        .filter_map(|mention| {
+            let chunk_id = chunk_ids_by_index.get(&mention.chunk_index)?.clone();
+            let entity_id = entity_ids_by_key
+                .get(&(mention.normalized_name.clone(), mention.entity_type.clone()))?
+                .clone();
+            Some((chunk_id, entity_id))
+        })
+        .collect();
+
+    for batch in resolved_mentions.chunks(BATCH_SIZE) {
+        let mut builder =
+            sqlx::QueryBuilder::new("INSERT INTO entity_mentions (chunk_id, entity_id) ");
+        builder.push_values(batch, |mut row, (chunk_id, entity_id)| {
+            row.push_bind(chunk_id).push_bind(entity_id);
+        });
+        builder.push(" ON CONFLICT DO NOTHING");
+        builder.build().execute(&mut *tx).await?;
     }
 
-    for relationship in &graph.relationships {
-        let Some(source_entity_id) = entity_ids_by_key.get(&(
-            relationship.source_normalized_name.clone(),
-            relationship.source_type.clone(),
-        )) else {
-            continue;
-        };
-        let Some(target_entity_id) = entity_ids_by_key.get(&(
-            relationship.target_normalized_name.clone(),
-            relationship.target_type.clone(),
-        )) else {
-            continue;
-        };
-        let evidence_chunk_id = chunk_ids_by_index
-            .get(&relationship.evidence_chunk_index)
-            .cloned();
+    struct ResolvedRelationship<'a> {
+        id: String,
+        source_entity_id: String,
+        target_entity_id: String,
+        relationship_type: &'a str,
+        description: Option<&'a str>,
+        weight: f64,
+        evidence_chunk_id: Option<String>,
+    }
 
-        sqlx::query(
-            r#"
-            INSERT INTO entity_relationships (
-                id,
+    let resolved_relationships: Vec<ResolvedRelationship<'_>> = graph
+        .relationships
+        .iter()
+        .filter_map(|relationship| {
+            let source_entity_id = entity_ids_by_key
+                .get(&(
+                    relationship.source_normalized_name.clone(),
+                    relationship.source_type.clone(),
+                ))?
+                .clone();
+            let target_entity_id = entity_ids_by_key
+                .get(&(
+                    relationship.target_normalized_name.clone(),
+                    relationship.target_type.clone(),
+                ))?
+                .clone();
+            let evidence_chunk_id = chunk_ids_by_index
+                .get(&relationship.evidence_chunk_index)
+                .cloned();
+            Some(ResolvedRelationship {
+                id: Uuid::new_v4().to_string(),
                 source_entity_id,
                 target_entity_id,
-                relationship_type,
-                description,
-                weight,
+                relationship_type: &relationship.relationship_type,
+                description: relationship.description.as_deref(),
+                weight: relationship.weight as f64,
                 evidence_chunk_id,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(source_entity_id)
-        .bind(target_entity_id)
-        .bind(&relationship.relationship_type)
-        .bind(relationship.description.as_deref())
-        .bind(relationship.weight as f64)
-        .bind(evidence_chunk_id)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+            })
+        })
+        .collect();
+
+    for batch in resolved_relationships.chunks(BATCH_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "INSERT INTO entity_relationships (id, source_entity_id, target_entity_id, relationship_type, description, weight, evidence_chunk_id, created_at) ",
+        );
+        builder.push_values(batch, |mut row, rel| {
+            row.push_bind(&rel.id)
+                .push_bind(&rel.source_entity_id)
+                .push_bind(&rel.target_entity_id)
+                .push_bind(rel.relationship_type)
+                .push_bind(rel.description)
+                .push_bind(rel.weight)
+                .push_bind(rel.evidence_chunk_id.as_deref())
+                .push_bind(&now);
+        });
+        builder.build().execute(&mut *tx).await?;
     }
 
     prune_orphan_entities(&mut tx).await?;

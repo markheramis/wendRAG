@@ -1,4 +1,4 @@
-/**
+/*!
  * Embedding encode/decode, dimension validation, and cosine similarity for the
  * SQLite BLOB-based embedding storage layer.
  */

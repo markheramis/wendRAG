@@ -1,4 +1,4 @@
-/**
+/*!
  * Dense, sparse, and graph search implementations for the PostgreSQL backend.
  */
 

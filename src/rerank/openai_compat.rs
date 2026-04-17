@@ -1,4 +1,4 @@
-/**
+/*!
  * OpenAI-compatible reranker provider.
  *
  * Implements the `RerankerProvider` trait against any server that exposes a

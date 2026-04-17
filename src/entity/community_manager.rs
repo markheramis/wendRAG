@@ -1,4 +1,4 @@
-/**
+/*!
  * Community management for entity graphs with optimized resource usage.
  * 
  * This module provides:
@@ -47,6 +47,11 @@ pub struct CommunityManager {
     detection_config: CommunityDetectionConfig,
     community_config: CommunityConfig,
     embedder: Arc<dyn EmbeddingProvider>,
+    /// Shared HTTP client for LLM summary requests (PERF-07). Constructing
+    /// a `reqwest::Client` allocates a connection pool; reusing the same
+    /// client across communities avoids re-establishing TCP/TLS for each
+    /// summary call.
+    http_client: reqwest::Client,
 }
 
 impl CommunityManager {
@@ -59,6 +64,7 @@ impl CommunityManager {
             detection_config,
             community_config,
             embedder,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -221,7 +227,7 @@ impl CommunityManager {
 
         let embedding = self
             .embedder
-            .embed(&[summary.clone()])
+            .embed(std::slice::from_ref(&summary))
             .await
             .map_err(CommunityManagerError::Embedding)?;
 
@@ -244,7 +250,6 @@ impl CommunityManager {
             "Summarize this group of related entities in 2-3 sentences:\n- {entity_list}"
         );
 
-        let client = reqwest::Client::new();
         let body = serde_json::json!({
             "model": self.community_config.llm_model,
             "messages": [{"role": "user", "content": prompt}],
@@ -257,7 +262,8 @@ impl CommunityManager {
             self.community_config.llm_base_url.trim_end_matches('/')
         );
 
-        let response = client
+        let response = self
+            .http_client
             .post(&url)
             .bearer_auth(&self.community_config.llm_api_key)
             .json(&body)

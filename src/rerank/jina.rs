@@ -1,4 +1,4 @@
-/**
+/*!
  * Jina Reranker API provider.
  *
  * Implements the `RerankerProvider` trait against the Jina Reranker API

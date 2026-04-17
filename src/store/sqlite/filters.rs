@@ -1,4 +1,4 @@
-/**
+/*!
  * Dynamic SQL filter fragment builder for the SQLite backend, shared by dense,
  * sparse, and graph queries.
  */

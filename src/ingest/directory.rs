@@ -1,4 +1,4 @@
-/**
+/*!
  * Directory-level ingestion: glob discovery, concurrent file processing,
  * orphan cleanup, and aggregate status reporting.
  */
@@ -67,14 +67,18 @@ pub async fn ingest_directory(
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INGESTS));
     let mut tasks: JoinSet<(usize, String, Result<IngestResult, IngestError>)> = JoinSet::new();
 
-    let options = options.clone();
+    // PERF-08: wrap `IngestOptions` in an `Arc` so each spawned task clones
+    // a single 8-byte pointer instead of the full struct (which contains
+    // `Vec<String>` tags and optional `Arc<...>` fields that would each
+    // re-bump refcounts on every file).
+    let options = Arc::new(options.clone());
     let total_files = file_paths.len();
 
     for (index, path_string) in file_paths.iter().enumerate() {
         let storage = storage.clone();
         let embedder = embedder.clone();
         let path_string = path_string.clone();
-        let options = options.clone();
+        let options = Arc::clone(&options);
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         tasks.spawn(async move {

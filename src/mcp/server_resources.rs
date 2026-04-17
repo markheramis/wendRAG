@@ -1,4 +1,4 @@
-/**
+/*!
  * MCP resource handler methods for the WendRagServer, building JSON payloads
  * for the `rag://status`, `rag://documents`, `rag://documents/{id}`,
  * `rag://config`, and `rag://communities` resources.

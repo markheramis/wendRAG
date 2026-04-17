@@ -1,4 +1,4 @@
-/**
+/*!
  * Semantic chunking with Max-Min algorithm improvements.
  *
  * Implements:
@@ -137,7 +137,7 @@ fn filter_garbage_sentences(sentences: Vec<String>) -> Vec<String> {
             let len = trimmed.len();
 
             // Filter by length
-            if len < MIN_SENTENCE_LENGTH || len > MAX_SENTENCE_LENGTH {
+            if !(MIN_SENTENCE_LENGTH..=MAX_SENTENCE_LENGTH).contains(&len) {
                 return false;
             }
 
@@ -283,10 +283,9 @@ fn find_breakpoints_maxmin(
         let mut forced_break = forced_break_interval;
         while forced_break < similarities.len() {
             // Only add if not already near an existing breakpoint
-            let already_near = breakpoints.iter().any(|bp| {
-                let diff = if *bp > forced_break { *bp - forced_break } else { forced_break - *bp };
-                diff < SENTENCE_GROUP_SIZE
-            });
+            let already_near = breakpoints
+                .iter()
+                .any(|bp| (*bp).abs_diff(forced_break) < SENTENCE_GROUP_SIZE);
 
             if !already_near {
                 breakpoints.push(forced_break);

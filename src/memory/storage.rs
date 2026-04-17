@@ -1,4 +1,4 @@
-/**
+/*!
  * Storage trait for the memory persistence layer.
  *
  * Backends implement this trait against PostgreSQL or SQLite. The trait

@@ -1,4 +1,4 @@
-/**
+/*!
  * Session buffer for short-term in-memory conversation storage.
  *
  * Manages the conversation context within a single session,
@@ -149,13 +149,6 @@ impl SessionBuffer {
     }
 
     /**
-     * Get all messages in the buffer.
-     */
-    pub fn get_all_messages(&self) -> Vec<ChatMessage> {
-        self.messages.iter().cloned().collect()
-    }
-
-    /**
      * Get the total number of messages in the buffer.
      */
     pub fn message_count(&self) -> usize {
@@ -197,25 +190,6 @@ impl SessionBuffer {
         while self.messages.len() > keep {
             self.messages.pop_front();
         }
-    }
-
-    /**
-     * Clear all messages from the buffer.
-     */
-    pub fn clear(&mut self) {
-        self.messages.clear();
-        self.last_active = Utc::now();
-    }
-
-    /**
-     * Update the session summary.
-     *
-     * Parameters:
-     * - `summary`: Summary text to store.
-     */
-    pub fn set_summary(&mut self, summary: impl Into<String>) {
-        self.summary = Some(summary.into());
-        self.last_active = Utc::now();
     }
 
     /**

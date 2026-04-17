@@ -1,4 +1,4 @@
-/**
+/*!
  * Reranking module.
  *
  * Provides an optional post-retrieval reranking stage that improves precision
@@ -34,7 +34,7 @@ impl RerankerProviderKind {
      * Accepts common aliases (`cohere`, `jina`, `openai-compatible`).
      * Returns `None` for unrecognised values.
      */
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "cohere" => Some(Self::Cohere),
             "jina" => Some(Self::Jina),
@@ -103,26 +103,26 @@ mod tests {
     #[test]
     fn provider_kind_parsing() {
         assert_eq!(
-            RerankerProviderKind::from_str("cohere"),
+            RerankerProviderKind::parse("cohere"),
             Some(RerankerProviderKind::Cohere)
         );
         assert_eq!(
-            RerankerProviderKind::from_str("jina"),
+            RerankerProviderKind::parse("jina"),
             Some(RerankerProviderKind::Jina)
         );
         assert_eq!(
-            RerankerProviderKind::from_str("openai-compatible"),
+            RerankerProviderKind::parse("openai-compatible"),
             Some(RerankerProviderKind::OpenAiCompatible)
         );
         assert_eq!(
-            RerankerProviderKind::from_str("openai_compatible"),
+            RerankerProviderKind::parse("openai_compatible"),
             Some(RerankerProviderKind::OpenAiCompatible)
         );
         assert_eq!(
-            RerankerProviderKind::from_str("openai-compat"),
+            RerankerProviderKind::parse("openai-compat"),
             Some(RerankerProviderKind::OpenAiCompatible)
         );
-        assert_eq!(RerankerProviderKind::from_str("unknown"), None);
+        assert_eq!(RerankerProviderKind::parse("unknown"), None);
     }
 
     /**

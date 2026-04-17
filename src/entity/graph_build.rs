@@ -1,4 +1,4 @@
-/**
+/*!
  * Aggregates per-chunk entity extractions into a deduplicated document-level
  * graph and embeds canonical entity descriptions.
  */

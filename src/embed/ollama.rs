@@ -1,4 +1,4 @@
-/**
+/*!
  * Ollama embedding provider for local embeddings.
  *
  * Implements the `EmbeddingProvider` trait against a local Ollama server

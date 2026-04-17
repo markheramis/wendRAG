@@ -1,4 +1,4 @@
-/**
+/*!
  * Community persistence for the PostgreSQL backend.
  *
  * Uses pgvector HNSW index for ANN search over community summary embeddings

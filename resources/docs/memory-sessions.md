@@ -26,12 +26,16 @@ Store a memory entry for later retrieval.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `content` | string | required | The content to remember |
+| `content` | string | required | The content to remember (≤ 1 MiB) |
 | `scope` | string | `"user"` | `"session"`, `"user"`, or `"global"` |
 | `entry_type` | string | `"fact"` | `"fact"`, `"preference"`, `"event"`, `"summary"`, or `"message"` |
 | `user_id` | string | - | User identifier for user-scoped memories |
 | `session_id` | string | - | Session identifier for session-scoped memories |
 | `importance` | float | `0.5` | Importance score (0.0 to 1.0) |
+
+Content exceeding 1 MiB is rejected before any embedding call runs. See
+[mcp-tools.md](mcp-tools.md#input-size-limits) for the full set of
+server-side caps.
 
 ### `memory_retrieve`
 
@@ -39,7 +43,7 @@ Search stored memories using semantic similarity.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `query` | string | required | Natural language search query |
+| `query` | string | required | Natural language search query (≤ 10 KiB) |
 | `user_id` | string | - | Filter by user ID |
 | `session_id` | string | - | Filter by session ID |
 | `scope` | string | - | Filter by scope |

@@ -1,4 +1,4 @@
-/**
+/*!
  * Query routing module for automatic retrieval strategy selection.
  *
  * This module implements two-tier retrieval routing:

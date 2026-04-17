@@ -1,4 +1,4 @@
-/**
+/*!
  * Community detection for entity graphs using optimized Louvain algorithm.
  * 
  * This module implements fast, resource-efficient community detection to enable
@@ -83,8 +83,8 @@ pub fn detect_communities(
     
     // Convert to output format
     communities
-        .into_iter()
-        .map(|(_community_id, node_indices)| {
+        .into_values()
+        .map(|node_indices| {
             let entity_ids: Vec<String> = node_indices
                 .iter()
                 .filter_map(|&idx| entities.get(idx))
@@ -128,35 +128,6 @@ impl SparseGraph {
         self.node_index.len()
     }
 
-    /**
-     * Returns the entity name for a given node index.
-     *
-     * FUTURE USE: Reverse lookup for graph serialization/persistence.
-     * When saving/loading SparseGraph without the original entities slice,
-     * this enables decoding node indices back to entity names.
-     *
-     * Also useful for debugging community detection at the algorithm level
-     * where only the graph (not the external entities slice) is available.
-     */
-    #[allow(dead_code)]
-    fn get_entity_name(&self, index: usize) -> Option<&String> {
-        self.node_index
-            .iter()
-            .find(|&(_, idx)| idx == &index)
-            .map(|(name, _)| name)
-    }
-
-    /**
-     * Returns all entity names in the graph.
-     *
-     * FUTURE USE: Debug logging and graph introspection without external data.
-     * Enables validation and logging during community detection when the
-     * original entities slice is not available.
-     */
-    #[allow(dead_code)]
-    fn entity_names(&self) -> Vec<&String> {
-        self.node_index.keys().collect()
-    }
 }
 
 fn build_sparse_graph(
@@ -180,18 +151,17 @@ fn build_sparse_graph(
         if let (Some(&src_idx), Some(&tgt_idx)) = (
             node_index.get(&edge.source_normalized_name),
             node_index.get(&edge.target_normalized_name),
-        ) {
-            if src_idx != tgt_idx {
-                let weight = edge.weight as f64;
-                
-                // Add both directions (undirected graph)
-                adjacency[src_idx].push((tgt_idx, edge.weight));
-                adjacency[tgt_idx].push((src_idx, edge.weight));
-                
-                node_degrees[src_idx] += weight;
-                node_degrees[tgt_idx] += weight;
-                total_weight += 2.0 * weight;
-            }
+        ) && src_idx != tgt_idx
+        {
+            let weight = edge.weight as f64;
+
+            // Add both directions (undirected graph)
+            adjacency[src_idx].push((tgt_idx, edge.weight));
+            adjacency[tgt_idx].push((src_idx, edge.weight));
+
+            node_degrees[src_idx] += weight;
+            node_degrees[tgt_idx] += weight;
+            total_weight += 2.0 * weight;
         }
     }
     

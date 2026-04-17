@@ -67,7 +67,24 @@ fn binary_path() -> std::path::PathBuf {
  * with tracing routed to stderr so we can capture log output.
  */
 fn spawn_server(port: u16) -> Child {
-    Command::new(binary_path())
+    spawn_server_with_env(port, &[])
+}
+
+/**
+ * Variant that lets a caller inject additional environment variables, used
+ * by the auth tests to enable `WEND_RAG_API_KEY` without duplicating the
+ * entire spawn block. Pins `WEND_RAG_KEYS_FILE` to a unique tempfile so
+ * parallel test runs never collide and the developer's real keys store is
+ * never touched.
+ */
+fn spawn_server_with_env(port: u16, extra_env: &[(&str, &str)]) -> Child {
+    let keys_file = std::env::temp_dir().join(format!(
+        "wend-rag-test-keys-{port}-{}.json",
+        std::process::id()
+    ));
+
+    let mut command = Command::new(binary_path());
+    command
         .arg("daemon")
         .env("WEND_RAG_HOST", "127.0.0.1")
         .env("WEND_RAG_PORT", port.to_string())
@@ -78,11 +95,16 @@ fn spawn_server(port: u16) -> Child {
         .env("WEND_RAG_EMBEDDING_BASE_URL", "http://127.0.0.1:1")
         .env("WEND_RAG_EMBEDDING_MODEL", "unused")
         .env("WEND_RAG_EMBEDDING_DIMENSIONS", "1024")
+        .env("WEND_RAG_KEYS_FILE", keys_file.to_string_lossy().to_string())
         .env("RUST_LOG", "info")
         .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("failed to spawn wend-rag process")
+        .stdout(Stdio::null());
+
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    command.spawn().expect("failed to spawn wend-rag process")
 }
 
 /**
@@ -160,6 +182,84 @@ fn collect_stderr(child: &mut Child) -> String {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+/**
+ * Verifies that enabling `WEND_RAG_API_KEY` protects `/mcp` with Bearer
+ * auth while leaving `/health` open. Covers the core auth flow without
+ * needing a full MCP handshake.
+ */
+#[tokio::test]
+async fn mcp_requires_bearer_token_when_api_key_is_set() {
+    let port = free_port();
+    let api_key = "wrag_integration_test_key_abcdef1234567890";
+    let mut child = spawn_server_with_env(port, &[("WEND_RAG_API_KEY", api_key)]);
+
+    wait_for_healthy(port).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // /health remains open even when auth is enabled.
+    let health = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .expect("GET /health failed");
+    assert_eq!(health.status(), 200, "/health must stay open");
+
+    // POST /mcp without Authorization is rejected.
+    let unauth = client
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .send()
+        .await
+        .expect("POST /mcp failed");
+    assert_eq!(
+        unauth.status(),
+        401,
+        "/mcp must return 401 without Authorization header"
+    );
+
+    // POST /mcp with an invalid Bearer token is rejected.
+    let wrong = client
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .header("Authorization", "Bearer wrag_wrong_token")
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .send()
+        .await
+        .expect("POST /mcp with bad token failed");
+    assert_eq!(
+        wrong.status(),
+        401,
+        "/mcp must return 401 for an unknown token"
+    );
+
+    // POST /mcp with the correct Bearer token is NOT 401 -- the MCP layer
+    // may return a different 4xx for a malformed JSON-RPC payload, but the
+    // auth middleware itself must let the request through.
+    let ok = client
+        .post(format!("http://127.0.0.1:{port}/mcp"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .send()
+        .await
+        .expect("POST /mcp with good token failed");
+    assert_ne!(
+        ok.status(),
+        401,
+        "/mcp must accept the configured Bearer token; status was {}",
+        ok.status()
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
 
 #[tokio::test]
 async fn health_endpoint_returns_ok() {

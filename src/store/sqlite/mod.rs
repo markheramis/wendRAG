@@ -1,4 +1,4 @@
-/**
+/*!
  * SQLite storage backend: struct definition, connection, and trait
  * implementation that delegates to focused submodules.
  */
@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::entity::{CommunityWithSummary, DocumentEntityGraph};
 use crate::retrieve::ScoredChunk;
-use crate::store::models::{Document, DocumentChunk, DocumentWithChunkCount, StoredCommunity};
+use crate::store::models::{
+    Document, DocumentChunk, DocumentChunkWithMeta, DocumentWithChunkCount, StoredCommunity,
+};
 
 use crate::config::PoolConfig;
 
@@ -36,7 +38,8 @@ use embeddings::{
 use entity_graph::prune_orphan_entities;
 use filters::push_sqlite_document_filters;
 use mappers::{
-    encode_tags, map_document_chunk_row, map_document_row, map_document_with_chunk_count_row,
+    encode_tags, map_document_chunk_row, map_document_chunk_with_meta_row, map_document_row,
+    map_document_with_chunk_count_row,
     map_scored_chunk_row, parse_uuid_text,
 };
 use text_util::{build_fts5_query, escape_like_pattern, trigram_similarity};
@@ -268,23 +271,34 @@ impl StorageBackend for SqliteBackend {
             .execute(&mut *tx)
             .await?;
 
+        // PERF-02: multi-row INSERT in batches of CHUNK_INSERT_BATCH_SIZE.
+        // Replaces an N-round-trip per-chunk loop with roughly
+        // N/50 round-trips while staying well below SQLite's default
+        // `SQLITE_LIMIT_VARIABLE_NUMBER = 999` parameter cap (7 params per
+        // row x 50 rows = 350 parameters).
+        /// Rows per multi-row INSERT batch for chunks.
+        const CHUNK_INSERT_BATCH_SIZE: usize = 50;
+
         for chunk in chunks {
             validate_embedding_dimensions(&chunk.embedding)?;
-            sqlx::query(
-                r#"
-                INSERT INTO chunks (id, document_id, content, chunk_index, section_title, embedding, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(document_id.to_string())
-            .bind(&chunk.content)
-            .bind(chunk.chunk_index)
-            .bind(chunk.section_title.as_deref())
-            .bind(embedding_to_blob(&chunk.embedding))
-            .bind(Utc::now().to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let document_id_text = document_id.to_string();
+        for batch in chunks.chunks(CHUNK_INSERT_BATCH_SIZE) {
+            let mut builder = sqlx::QueryBuilder::new(
+                "INSERT INTO chunks (id, document_id, content, chunk_index, section_title, embedding, created_at) ",
+            );
+            builder.push_values(batch, |mut row, chunk| {
+                row.push_bind(Uuid::new_v4().to_string())
+                    .push_bind(&document_id_text)
+                    .push_bind(&chunk.content)
+                    .push_bind(chunk.chunk_index)
+                    .push_bind(chunk.section_title.as_deref())
+                    .push_bind(embedding_to_blob(&chunk.embedding))
+                    .push_bind(&now);
+            });
+            builder.build().execute(&mut *tx).await?;
         }
 
         tx.commit().await
@@ -293,7 +307,7 @@ impl StorageBackend for SqliteBackend {
     async fn replace_document_entity_graph(
         &self,
         document_id: Uuid,
-        graph: &DocumentEntityGraph,
+        graph: &mut DocumentEntityGraph,
     ) -> Result<(), sqlx::Error> {
         entity_graph::replace_document_entity_graph(&self.pool, document_id, graph).await
     }
@@ -542,6 +556,52 @@ impl StorageBackend for SqliteBackend {
         .await?;
 
         rows.into_iter().map(map_document_chunk_row).collect()
+    }
+
+    async fn get_chunks_by_index(
+        &self,
+        file_path: Option<&str>,
+        document_id: Option<Uuid>,
+        start_index: i32,
+        end_index: i32,
+    ) -> Result<Vec<DocumentChunkWithMeta>, sqlx::Error> {
+        if file_path.is_some() == document_id.is_some() {
+            return Ok(Vec::new());
+        }
+        if end_index < start_index {
+            return Ok(Vec::new());
+        }
+
+        let document_id_text = document_id.map(|id| id.to_string());
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                d.id          AS document_id,
+                d.file_path   AS file_path,
+                d.file_name   AS file_name,
+                c.chunk_index AS chunk_index,
+                c.section_title AS section_title,
+                c.content     AS content
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE (? IS NULL OR d.file_path = ?)
+              AND (? IS NULL OR d.id = ?)
+              AND c.chunk_index BETWEEN ? AND ?
+            ORDER BY c.chunk_index ASC
+            "#,
+        )
+        .bind(file_path)
+        .bind(file_path)
+        .bind(document_id_text.as_deref())
+        .bind(document_id_text.as_deref())
+        .bind(start_index)
+        .bind(end_index)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(map_document_chunk_with_meta_row)
+            .collect()
     }
 
     async fn delete_document(

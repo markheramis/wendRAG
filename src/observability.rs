@@ -1,4 +1,4 @@
-/**
+/*!
  * OpenTelemetry observability setup.
  *
  * Configures distributed tracing with OTLP export when the

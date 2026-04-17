@@ -1,4 +1,4 @@
-/**
+/*!
  * Entity extraction, graph aggregation, and normalization for the wendRAG
  * knowledge graph pipeline.
  */

@@ -1,4 +1,4 @@
-/**
+/*!
  * Entity graph persistence and orphan pruning for the PostgreSQL backend.
  */
 
@@ -17,7 +17,7 @@ use crate::entity::DocumentEntityGraph;
 pub(crate) async fn replace_document_entity_graph(
     pool: &PgPool,
     document_id: Uuid,
-    graph: &DocumentEntityGraph,
+    graph: &mut DocumentEntityGraph,
 ) -> Result<(), sqlx::Error> {
     if graph.is_empty() {
         let mut tx = pool.begin().await?;
@@ -39,7 +39,12 @@ pub(crate) async fn replace_document_entity_graph(
         .collect();
     let mut entity_ids_by_key: HashMap<(String, String), Uuid> = HashMap::new();
 
-    for entity in &graph.entities {
+    // PERF-03: move the owned embedding `Vec<f32>` into the pgvector
+    // `Vector` per iteration instead of cloning. A 1024-dim embedding is
+    // 4 KiB; the previous `.clone()` caused ~200 KiB of allocation churn
+    // per document with 50 entities.
+    for entity in &mut graph.entities {
+        let embedding = std::mem::take(&mut entity.embedding);
         let row = sqlx::query_as::<_, (Uuid,)>(
             r#"
             INSERT INTO entities (
@@ -63,7 +68,7 @@ pub(crate) async fn replace_document_entity_graph(
         .bind(&entity.display_name)
         .bind(&entity.entity_type)
         .bind(entity.description.as_deref())
-        .bind(Vector::from(entity.embedding.clone()))
+        .bind(Vector::from(embedding))
         .fetch_one(&mut *tx)
         .await?;
 

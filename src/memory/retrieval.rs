@@ -1,4 +1,4 @@
-/**
+/*!
  * Memory retrieval with hybrid semantic + recency-weighted scoring.
  *
  * Combines embedding cosine similarity with temporal proximity and importance
@@ -11,7 +11,7 @@ use crate::embed::EmbeddingProvider;
 use crate::memory::{
     calculate_recency_weighted_score,
     storage::{MemoryStorage, MemoryStorageError},
-    types::{ChatMessage, MemoryEntry, MemoryQuery, MemoryScope, MemoryType, MessageRole},
+    types::{ChatMessage, MemoryEntry, MemoryQuery, MemoryScope, MessageRole},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,46 +187,10 @@ pub struct ScoredMemory {
     pub score: f32,
 }
 
-/**
- * Builds comprehensive context from session state and long-term memory
- * for injection into LLM prompts.
- */
-pub async fn build_memory_context(
-    session_summary: Option<String>,
-    recent_messages: Vec<ChatMessage>,
-    _storage: Arc<dyn MemoryStorage>,
-    query: &str,
-    user_id: Option<&str>,
-    retriever: &MemoryRetriever,
-    max_memories: usize,
-    recency_weight: f32,
-) -> Result<MemoryContext, MemoryStorageError> {
-    let mut context = MemoryContext::empty();
-    context.session_summary = session_summary;
-    context.recent_messages = recent_messages;
-
-    let scored = retriever
-        .retrieve(query, user_id, max_memories, recency_weight)
-        .await?;
-
-    for s in scored {
-        match s.memory.metadata.entry_type {
-            MemoryType::Preference => {
-                context.user_preferences.push(s.memory.content.clone());
-            }
-            _ => {
-                context.relevant_memories.push(s.memory);
-            }
-        }
-    }
-
-    context.estimated_tokens = context.estimate_tokens();
-    Ok(context)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::types::MemoryType;
 
     #[test]
     fn test_memory_context_empty() {
@@ -282,7 +246,7 @@ mod tests {
         let m1 = MemoryEntry::new(MemoryScope::User, None, None, "Fact 1", MemoryType::Fact);
         let m2 = MemoryEntry::new(MemoryScope::User, None, None, "Fact 2", MemoryType::Fact);
 
-        let mut vec = vec![
+        let mut vec = [
             ScoredMemory { memory: m2, score: 0.5 },
             ScoredMemory { memory: m1, score: 0.9 },
         ];

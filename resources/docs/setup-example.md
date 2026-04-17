@@ -241,10 +241,13 @@ wendRAG — RAG-powered MCP server
 Usage: wend-rag [OPTIONS] <COMMAND>
 
 Commands:
-  daemon   Start the RAG + MCP service over HTTP
-  ingest   One-shot document ingestion, then exit
-  stdio    Start the MCP server over stdio transport
-  help     Print this message or the help of the given subcommand(s)
+  daemon        Start the RAG + MCP service over HTTP
+  ingest        One-shot document ingestion, then exit
+  stdio         Start the MCP server over stdio transport
+  key:generate  Generate a new API key for HTTP transport authentication
+  key:list      List registered API keys (name, prefix, created_at)
+  key:revoke    Revoke an API key by name
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
   -c, --config <CONFIG>  Path to YAML config file
@@ -345,32 +348,75 @@ TEST_DATABASE_URL=postgres://your_username:your_password@your_host:5432/your_dat
   cargo test --test backend_parity
 ```
 
-Expected output:
+Expected output (test count may grow over time):
 
 ```
-running 6 tests
+running 9 tests
 test backends_bootstrap_empty_store ... ok
 test backends_match_ingest_and_search_behaviour ... ok
-test backends_return_ordered_document_chunks_for_full_context ... ok
+test backends_return_ordered_document_chunks ... ok
+test backends_return_chunks_by_index ... ok
 test graph_retrieval_works_on_all_backends ... ok
+test incremental_sync_postgres ... ok
+test incremental_sync_sqlite ... ok
 test url_ingestion_respects_robots_txt ... ok
 test url_ingestion_works_on_all_backends ... ok
 
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured
 ```
 
 ---
 
-## Step 12 — Connect an MCP Client
+## Step 12 — Generate an API Key (Recommended for Production)
 
-The server exposes MCP over HTTP at `http://your-ec2-public-ip:3000/mcp`. Add to your MCP client config:
+When the server is reachable from the public internet, enable Bearer
+token authentication before connecting any client. See
+[authentication-setup.md](authentication-setup.md) for the full guide.
+
+On the EC2 host, as the same user that runs the systemd service:
+
+```bash
+wendRAG key:generate --name prod-client
+```
+
+Copy the printed `Key:` value — it is the only time it will be shown.
+The key is persisted as a SHA-256 hash at
+`$HOME/.wend-rag/keys.json` (owner-read-only on Unix).
+
+Restart the service so it loads the new keys file:
+
+```bash
+sudo systemctl restart wendrag
+```
+
+The daemon log will now include:
+
+```
+INFO wend_rag: API key authentication enabled on /mcp key_count=1
+```
+
+From this point on, unauthenticated requests to `/mcp` return `401
+Unauthorized`. `/health` stays open for load-balancer probes.
+
+---
+
+## Step 13 — Connect an MCP Client
+
+The server exposes MCP over HTTP at `http://your-ec2-public-ip:3000/mcp`.
+See [mcp-client-setup.md](mcp-client-setup.md) for per-client config
+(Cursor, Claude Desktop, VS Code, Codex, Windsurf, and raw curl).
+
+The most common form is:
 
 ```json
 {
   "mcpServers": {
-    "code-rag": {
+    "wendRAG": {
       "type": "http",
-      "url": "http://your-ec2-public-ip:3000/mcp"
+      "url": "http://your-ec2-public-ip:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer wrag_your_generated_key_here"
+      }
     }
   }
 }
@@ -384,7 +430,18 @@ Or use stdio mode (for clients that launch the process directly):
 wend-rag stdio
 ```
 
-The `mcp.json` in the repo root has ready-made entries for both transports.
+Quick smoke test with curl:
+
+```bash
+# /health never requires auth
+curl http://your-ec2-public-ip:3000/health
+
+# /mcp requires the key
+curl -X POST http://your-ec2-public-ip:3000/mcp \
+  -H "Authorization: Bearer wrag_your_generated_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
 ---
 
@@ -421,16 +478,19 @@ Ingested documents will now have entities and relationships extracted and stored
 
 ## Environment Variable Reference
 
-All environment variables use the `WEND_RAG_` prefix. The YAML config file takes priority over these.
+All environment variables use the `WEND_RAG_` prefix. The YAML config file takes priority over these. See [configuration.md](configuration.md) for the authoritative reference including memory, community, and reranker variables.
 
 | Variable | Description | Default |
 |---|---|---|
 | `WEND_RAG_HOST` | Bind address | `0.0.0.0` |
 | `WEND_RAG_PORT` | HTTP port | `3000` |
-| `WEND_RAG_STORAGE_BACKEND` | `postgres` or `sqlite` | `sqlite` |
+| `WEND_RAG_CONFIG` | Override YAML config file path | `/etc/wend-rag/config.yaml` |
+| `WEND_RAG_API_KEY` | Optional static Bearer token for `/mcp` | *(unset — auth disabled)* |
+| `WEND_RAG_KEYS_FILE` | Override path for the `keys.json` store | `$HOME/.wend-rag/keys.json` |
+| `WEND_RAG_STORAGE_BACKEND` | `postgres` or `sqlite` | auto |
 | `WEND_RAG_DATABASE_URL` | PostgreSQL connection URL | *(none)* |
 | `WEND_RAG_SQLITE_PATH` | SQLite file path | `./wend-rag.db` |
-| `WEND_RAG_EMBEDDING_PROVIDER` | `openai`, `voyage`, or `openai-compatible` | `openai` |
+| `WEND_RAG_EMBEDDING_PROVIDER` | `openai`, `voyage`, `ollama`, or `openai-compatible` | `openai` |
 | `WEND_RAG_EMBEDDING_API_KEY` | API key for embedding service | *(empty)* |
 | `WEND_RAG_EMBEDDING_BASE_URL` | Embedding API base URL | *(provider default)* |
 | `WEND_RAG_EMBEDDING_MODEL` | Embedding model name | *(provider default)* |
@@ -441,11 +501,27 @@ All environment variables use the `WEND_RAG_` prefix. The YAML config file takes
 | `WEND_RAG_ENTITY_EXTRACTION_API_KEY` | API key for extraction | *(falls back to embedding key)* |
 | `WEND_RAG_GRAPH_RETRIEVAL_ENABLED` | Enable graph retrieval | `false` |
 | `WEND_RAG_GRAPH_TRAVERSAL_DEPTH` | Graph traversal depth (1–3) | `2` |
+| `WEND_RAG_COMMUNITY_LLM_SUMMARIES` | Enable LLM-generated community summaries | `false` |
+| `WEND_RAG_COMMUNITY_LLM_URL` | Community summary endpoint | *(falls back to entity extraction URL)* |
+| `WEND_RAG_COMMUNITY_LLM_MODEL` | Community summary model | *(falls back to entity extraction model)* |
+| `WEND_RAG_COMMUNITY_LLM_API_KEY` | Community summary API key | *(falls back to entity extraction key)* |
+| `WEND_RAG_RERANKER_ENABLED` | Enable reranker | `false` |
+| `WEND_RAG_RERANKER_PROVIDER` | `cohere`, `jina`, or `openai-compatible` | `openai-compatible` |
+| `WEND_RAG_RERANKER_BASE_URL` | Reranker endpoint | *(empty)* |
+| `WEND_RAG_RERANKER_MODEL` | Reranker model name | `rerank-v3.5` |
+| `WEND_RAG_RERANKER_API_KEY` | Reranker API key | *(falls back to embedding key)* |
 | `WEND_RAG_CHUNKING_STRATEGY` | `fixed` or `semantic` | `fixed` |
 | `WEND_RAG_CHUNKING_SEMANTIC_THRESHOLD` | Semantic breakpoint percentile | `0.25` |
+| `WEND_RAG_CHUNKING_MAX_SENTENCES` | Max sentences per chunk | `20` |
+| `WEND_RAG_CHUNKING_FILTER_GARBAGE` | Filter boilerplate before chunking | `true` |
+| `WEND_RAG_MEMORY_ENABLED` | Enable the memory subsystem | `false` |
+| `WEND_RAG_MEMORY_SESSION_TIMEOUT` | Session-buffer timeout (seconds) | `3600` |
+| `WEND_RAG_MEMORY_DECAY_RATE` | Ebbinghaus decay α | `0.02` |
+| `WEND_RAG_MEMORY_PRUNE_THRESHOLD` | Minimum importance retained | `0.3` |
+| `WEND_RAG_MEMORY_MAX_PER_QUERY` | Max memories per `memory_retrieve` | `20` |
+| `WEND_RAG_MEMORY_RECENCY_WEIGHT` | Relevance-vs-recency balance | `0.3` |
 | `WEND_RAG_POOL_MAX_CONNECTIONS` | DB connection pool size | `20` |
 | `WEND_RAG_POOL_ACQUIRE_TIMEOUT_SECS` | Pool acquire timeout (seconds) | `60` |
-| `WEND_RAG_CONFIG` | Override config file path | `/etc/wend-rag/config.yaml` |
 
 ---
 

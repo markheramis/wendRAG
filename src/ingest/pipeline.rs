@@ -1,12 +1,19 @@
-/**
+/*!
  * Core single-document ingestion pipeline: hash-based short-circuit, chunking,
  * embedding, optional entity extraction, and storage upsert.
  */
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
+
+/// Maximum number of concurrent LLM entity-extraction calls issued per
+/// document. Four is a conservative default that noticeably accelerates
+/// ingestion of long documents without overwhelming upstream rate limits.
+const ENTITY_EXTRACTION_CONCURRENCY: usize = 4;
 
 use crate::config::ChunkingStrategy;
 use crate::embed::EmbeddingProvider;
@@ -29,7 +36,12 @@ pub use super::types::{
 /**
  * Ingests either a single file or all supported files beneath a directory path.
  * Returns aggregate counters plus per-document status for CLI and MCP callers.
+ *
+ * The wide argument list mirrors the fully-populated `IngestOptions` that
+ * the CLI / MCP layer assembles from config. A builder would just move the
+ * wiring one level down without reducing the total surface area.
  */
+#[allow(clippy::too_many_arguments)]
 pub async fn ingest_path(
     storage: &Arc<dyn StorageBackend>,
     embedder: &Arc<dyn EmbeddingProvider>,
@@ -83,7 +95,11 @@ pub async fn ingest_path(
 /**
  * Ingests a file from disk by detecting its type, loading its contents, and
  * forwarding the normalized document to the shared content-ingestion flow.
+ *
+ * Wide argument list mirrors `IngestOptions`; see `ingest_path` for the
+ * rationale.
  */
+#[allow(clippy::too_many_arguments)]
 pub async fn ingest_file(
     storage: &Arc<dyn StorageBackend>,
     embedder: &Arc<dyn EmbeddingProvider>,
@@ -168,21 +184,33 @@ pub async fn ingest_content(
         .collect();
 
     let embeddings = embedder.embed(&texts).await?;
-    let document_graph = if let Some(entity_extractor) = options.entity_extractor.as_ref() {
-        let mut chunk_extractions = Vec::with_capacity(raw_chunks.len());
-        for chunk in &raw_chunks {
-            chunk_extractions.push(
-                entity_extractor
-                    .extract(EntityExtractionInput {
-                        file_name: request.file_name,
-                        file_type: request.file_type,
-                        chunk_index: chunk.chunk_index,
-                        section_title: chunk.section_title.as_deref(),
-                        content: chunk.content.as_str(),
-                    })
-                    .await?,
-            );
-        }
+    let mut document_graph = if let Some(entity_extractor) = options.entity_extractor.as_ref() {
+        // PERF-01: issue up to ENTITY_EXTRACTION_CONCURRENCY LLM calls
+        // concurrently. Preserves input order because `buffered` returns
+        // outputs in the same order as their futures were spawned, which
+        // downstream graph construction relies on.
+        //
+        // The futures are materialised into a `Vec` first so the iterator's
+        // borrow lifetime is decoupled from the stream's future lifetime --
+        // without this intermediate collection the HRTB inference on
+        // `buffered` fails ("FnOnce not general enough").
+        let extractor = entity_extractor.as_ref();
+        let extraction_futures: Vec<_> = raw_chunks
+            .iter()
+            .map(|chunk| {
+                extractor.extract(EntityExtractionInput {
+                    file_name: request.file_name,
+                    file_type: request.file_type,
+                    chunk_index: chunk.chunk_index,
+                    section_title: chunk.section_title.as_deref(),
+                    content: chunk.content.as_str(),
+                })
+            })
+            .collect();
+        let chunk_extractions: Vec<_> = stream::iter(extraction_futures)
+            .buffered(ENTITY_EXTRACTION_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         Some(build_document_entity_graph(&chunk_extractions, embedder).await?)
     } else {
@@ -215,7 +243,10 @@ pub async fn ingest_content(
     storage
         .replace_document_chunks(doc_id, &chunk_inserts)
         .await?;
-    if let Some(document_graph) = document_graph.as_ref() {
+    if let Some(document_graph) = document_graph.as_mut() {
+        // After this call entity embeddings have been moved out of the
+        // graph to avoid a per-entity clone (PERF-03). All other fields
+        // remain intact so downstream community analysis still works.
         storage
             .replace_document_entity_graph(doc_id, document_graph)
             .await?;
@@ -265,12 +296,80 @@ pub async fn ingest_content(
     })
 }
 
+/**
+ * Computes the hex-encoded SHA-256 of `data`.
+ *
+ * PERF-06: the naive `.map(|b| format!("{b:02x}")).collect()` version
+ * allocates a `String` per byte (32 allocations for a 256-bit digest). This
+ * implementation pre-allocates a single 64-byte `String` and writes each
+ * byte in place, eliminating the per-byte heap churn on a hot ingestion
+ * path.
+ */
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let digest = hasher.finalize();
+
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hex, "{byte:02x}").expect("writing to String is infallible");
+    }
+    hex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    /**
+     * PERF-06 correctness guard: the pre-allocated hex encoder must
+     * produce exactly the canonical SHA-256 digest of the empty string.
+     * Digest value sourced from FIPS 180-4 / NIST test vectors.
+     */
+    #[test]
+    fn sha256_hex_matches_known_empty_digest() {
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /**
+     * Canonical `"abc"` vector from FIPS 180-4 §D.1.
+     */
+    #[test]
+    fn sha256_hex_matches_known_abc_digest() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /**
+     * Shape contract: every SHA-256 output is exactly 64 lowercase hex
+     * characters, regardless of input length. This guards against
+     * regressions in the zero-padding (`{:02x}`) formatter.
+     */
+    #[test]
+    fn sha256_hex_output_is_always_64_lowercase_hex() {
+        for input in ["", "a", "the quick brown fox", &"x".repeat(10_000)] {
+            let digest = sha256_hex(input);
+            assert_eq!(digest.len(), 64, "digest for {input:?} must be 64 chars");
+            assert!(
+                digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "digest for {input:?} must be lowercase hex: {digest}"
+            );
+        }
+    }
+
+    /**
+     * Different inputs must produce different digests (sanity check on
+     * the hasher wiring; a regression that fed constant data to
+     * `hasher.update` would collapse every output to the same value).
+     */
+    #[test]
+    fn sha256_hex_is_sensitive_to_input_changes() {
+        assert_ne!(sha256_hex("foo"), sha256_hex("bar"));
+        assert_ne!(sha256_hex("foo"), sha256_hex("foo "));
+    }
 }

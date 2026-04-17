@@ -1,4 +1,4 @@
-/**
+/*!
  * OpenAI-compatible chat-completions client used for optional entity
  * extraction during the ingestion pipeline.
  */

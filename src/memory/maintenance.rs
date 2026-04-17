@@ -1,4 +1,4 @@
-/**
+/*!
  * Background maintenance task for the memory subsystem.
  *
  * Periodically runs decay, pruning, and session cleanup on a configurable

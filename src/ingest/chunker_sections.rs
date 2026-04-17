@@ -1,4 +1,4 @@
-/**
+/*!
  * Structural extraction strategies that split document content into titled
  * sections suitable for downstream chunking.
  */

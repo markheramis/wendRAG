@@ -1,4 +1,4 @@
-/**
+/*!
  * Cohere Rerank API provider.
  *
  * Implements the `RerankerProvider` trait against the Cohere Rerank v2 API

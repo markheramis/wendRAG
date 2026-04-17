@@ -11,20 +11,32 @@ pub const URL_FILE_TYPE: &str = "url";
  * Validates that a file path is safe to read (prevents directory traversal).
  *
  * Ensures the resolved absolute path:
- * - Does not escape the base directory via parent directory references (../)
- * - Is within the intended filesystem boundaries
+ * - Does not contain null bytes
+ * - Is not a Windows UNC path pointing at a remote share (SEC-05)
+ * - Exists and can be canonicalized (eliminates the TOCTOU symlink race
+ *   in SEC-04)
+ * - Stays inside the base directory after resolving symlinks and `..`
  *
  * Parameters:
  * - `path`: The user-provided path to validate.
  * - `base_dir`: Optional base directory that the path must stay within.
- *              If None, the current working directory is used.
+ *   If `None`, the current working directory is used.
  *
  * Returns:
- * - `Ok(PathBuf)` containing the canonicalized path if valid.
- * - `Err(ReadError)` if the path is invalid or escapes the base directory.
+ * - `Ok(PathBuf)` containing the canonicalized, verified path.
+ * - `Err(ReadError)` if the path is invalid, missing, or escapes the base.
+ *
+ * # Security notes
+ *
+ * The previous implementation fell back to returning the non-canonical
+ * absolute path when `canonicalize()` failed (e.g. because the file did
+ * not yet exist). That fallback created a TOCTOU window in which a symlink
+ * could be planted between the parent-directory check and the actual file
+ * open. This function now requires the path to exist and canonicalize
+ * cleanly, so the returned path is always the final target that will be
+ * read by the caller.
  */
 pub fn validate_safe_path(path: &str, base_dir: Option<&Path>) -> Result<PathBuf, ReadError> {
-    // Reject paths with null bytes
     if path.contains('\0') {
         return Err(ReadError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -32,45 +44,44 @@ pub fn validate_safe_path(path: &str, base_dir: Option<&Path>) -> Result<PathBuf
         )));
     }
 
-    // Parse the path
-    let path = Path::new(path);
+    // SEC-05: reject Windows UNC paths early. `Path::is_absolute()` returns
+    // `true` for these and `canonicalize()` may happily resolve them to a
+    // remote SMB share, bypassing the base-directory containment check.
+    #[cfg(windows)]
+    {
+        if path.starts_with("\\\\") || path.starts_with("//") {
+            return Err(ReadError::InvalidPath(
+                "UNC paths (\\\\server\\share) are not permitted".to_string(),
+            ));
+        }
+    }
 
-    // Get the base directory
+    let path_ref = Path::new(path);
+
     let base = match base_dir {
         Some(b) => b.to_path_buf(),
-        None => std::env::current_dir().map_err(|e| ReadError::Io(e))?,
+        None => std::env::current_dir().map_err(ReadError::Io)?,
     };
 
-    // Resolve to absolute path
-    let absolute_path = if path.is_absolute() {
-        path.to_path_buf()
+    let absolute_path = if path_ref.is_absolute() {
+        path_ref.to_path_buf()
     } else {
-        base.join(path)
+        base.join(path_ref)
     };
 
-    // Canonicalize the path (resolves symlinks and ../)
-    let canonical_base = base.canonicalize().map_err(|e| ReadError::Io(e))?;
-    let canonical_path = match absolute_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // Path doesn't exist yet - check if the parent is valid
-            // This allows creating new files in valid directories
-            if let Some(parent) = absolute_path.parent() {
-                let canonical_parent = parent.canonicalize().map_err(|e| ReadError::Io(e))?;
-                if !canonical_parent.starts_with(&canonical_base) {
-                    return Err(ReadError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "Path escapes base directory",
-                    )));
-                }
-            }
-            // Return the non-canonical path - caller will handle file creation
-            absolute_path
-        }
-    };
+    // SEC-04: require the path to exist and canonicalize. A failed
+    // canonicalize means the file doesn't exist, and this function is only
+    // used for *reading* existing files. Returning a non-canonical path
+    // would create a TOCTOU window in which a symlink could be planted.
+    let canonical_base = base.canonicalize().map_err(ReadError::Io)?;
+    let canonical_path = absolute_path.canonicalize().map_err(|e| {
+        ReadError::Io(std::io::Error::new(
+            e.kind(),
+            format!("could not resolve path '{}': {e}", absolute_path.display()),
+        ))
+    })?;
 
-    // Ensure the path is within the base directory
-    if canonical_path.exists() && !canonical_path.starts_with(&canonical_base) {
+    if !canonical_path.starts_with(&canonical_base) {
         return Err(ReadError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Path escapes base directory",
@@ -152,27 +163,20 @@ pub fn detect_file_type(path: &str) -> Option<&'static str> {
  * Reads a supported ingest source and normalizes it into a shared document
  * shape for the downstream chunking and embedding pipeline.
  *
- * SECURITY NOTE: For local files, this function validates the path to prevent
- * directory traversal attacks. The path must stay within the current working
- * directory or a specified base directory.
+ * # Security
  *
- * Parameters:
+ * For local files, this function validates the path to prevent directory
+ * traversal attacks. The path must stay within the current working
+ * directory or a specified `base_dir`.
+ *
+ * # Parameters
+ *
  * - `path`: Local filesystem path or absolute HTTP(S) URL.
- * - `base_dir`: Optional base directory for path validation (defaults to current dir).
- *
- * Returns:
- * - `ReadDocument` containing the normalized file name, file type, and text.
- */
-pub async fn read_source(
-    path: &str,
-    base_dir: Option<&Path>,
-) -> Result<ReadDocument, ReadError> {
-    read_source_with_options(path, base_dir, true).await
-}
-
-/**
- * Reads a source with configurable SSRF protection for URL ingestion.
- * Integration tests pass `enforce_ssrf = false` to reach local test servers.
+ * - `base_dir`: Optional base directory for path validation (defaults to
+ *   the current working directory).
+ * - `enforce_ssrf`: When true, URL ingestion blocks private / loopback /
+ *   link-local addresses and installs a DNS-level re-validation resolver.
+ *   Integration tests pass `false` to reach a local Axum test server.
  */
 pub async fn read_source_with_options(
     path: &str,
@@ -440,5 +444,120 @@ fn json_scalar_to_string(value: &serde_json::Value) -> String {
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Null => "null".to_string(),
         _ => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /**
+     * SEC-04 regression: a path that does not exist must fail validation.
+     *
+     * Previously `validate_safe_path` fell back to returning the
+     * non-canonical absolute path when `canonicalize()` failed. That
+     * fallback created a TOCTOU window where a symlink could be planted
+     * between the parent-directory check and the subsequent file open.
+     */
+    #[test]
+    fn validate_safe_path_rejects_nonexistent_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist.txt");
+
+        let result = validate_safe_path(
+            missing.to_str().unwrap(),
+            Some(tmp.path()),
+        );
+        assert!(
+            result.is_err(),
+            "expected a non-existent path to fail validation"
+        );
+    }
+
+    /**
+     * Files that do exist inside the base directory must resolve to an
+     * absolute, canonicalised path that starts with the canonical base.
+     */
+    #[test]
+    fn validate_safe_path_accepts_existing_file_inside_base() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("ok.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        let resolved =
+            validate_safe_path(file.to_str().unwrap(), Some(tmp.path())).unwrap();
+
+        assert!(resolved.exists());
+        let canonical_base = tmp.path().canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canonical_base),
+            "{resolved:?} must live inside {canonical_base:?}"
+        );
+    }
+
+    /**
+     * SEC-04: a path that, after canonicalisation, lies outside the base
+     * directory must be rejected. Uses two sibling temp dirs so the
+     * escape path is the canonical absolute form of the outsider.
+     */
+    #[test]
+    fn validate_safe_path_rejects_escape_via_absolute_path() {
+        let base = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outsider = outside.path().join("outside.txt");
+        fs::write(&outsider, b"secret").unwrap();
+
+        let result = validate_safe_path(
+            outsider.to_str().unwrap(),
+            Some(base.path()),
+        );
+        assert!(
+            result.is_err(),
+            "absolute path outside base must be rejected"
+        );
+    }
+
+    /**
+     * Inputs containing NUL bytes must be rejected up front. NUL
+     * truncation is a classic trick to disguise an attack path from
+     * filters that operate on `&str`.
+     */
+    #[test]
+    fn validate_safe_path_rejects_null_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = validate_safe_path("inno\0cent.txt", Some(tmp.path()));
+        assert!(result.is_err(), "null-byte paths must be rejected");
+    }
+
+    /**
+     * SEC-05: Windows UNC paths (`\\server\share\...`) must be rejected
+     * before `canonicalize()` has a chance to resolve them to a remote
+     * filesystem. On non-Windows targets this guard is inactive, which
+     * is exactly the behaviour we want to assert here by gating on
+     * `cfg(windows)`.
+     */
+    #[cfg(windows)]
+    #[test]
+    fn validate_safe_path_rejects_unc_paths_on_windows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let backslash = validate_safe_path(
+            r"\\server\share\secrets.txt",
+            Some(tmp.path()),
+        );
+        assert!(
+            backslash.is_err(),
+            "backslash UNC paths must be rejected on Windows"
+        );
+
+        let forward_slash = validate_safe_path(
+            "//server/share/secrets.txt",
+            Some(tmp.path()),
+        );
+        assert!(
+            forward_slash.is_err(),
+            "forward-slash UNC paths must be rejected on Windows"
+        );
     }
 }

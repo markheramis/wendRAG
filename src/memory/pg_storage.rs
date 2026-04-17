@@ -1,4 +1,4 @@
-/**
+/*!
  * PostgreSQL implementation of the MemoryStorage trait.
  *
  * Uses pgvector HNSW for embedding similarity search and standard SQL

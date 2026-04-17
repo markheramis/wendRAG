@@ -143,23 +143,12 @@ impl Default for QueryRoutingConfig {
  * are enabled, the configured endpoint generates richer community descriptions
  * with automatic fallback to synthetic on API errors.
  */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CommunityConfig {
     pub llm_summaries_enabled: bool,
     pub llm_base_url: String,
     pub llm_model: String,
     pub llm_api_key: String,
-}
-
-impl Default for CommunityConfig {
-    fn default() -> Self {
-        Self {
-            llm_summaries_enabled: false,
-            llm_base_url: String::new(),
-            llm_model: String::new(),
-            llm_api_key: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -396,7 +385,7 @@ impl Config {
             fc.reranker.provider.clone(),
         )
         .unwrap_or_else(|| "openai-compatible".into());
-        let reranker_provider = RerankerProviderKind::from_str(&reranker_provider_str)
+        let reranker_provider = RerankerProviderKind::parse(&reranker_provider_str)
             .unwrap_or(RerankerProviderKind::OpenAiCompatible);
 
         let reranker_base_url = yaml_or_env(
