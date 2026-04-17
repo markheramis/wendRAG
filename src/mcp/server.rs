@@ -91,6 +91,11 @@ pub struct WendRagServer {
     chunking_max_sentences: usize,
     chunking_filter_garbage: bool,
     pub(super) server_config: ServerConfig,
+    // Populated at construction and consumed by the `#[tool_handler]`
+    // macro's generated dispatch code. rustc's dead-code lint cannot see
+    // through the macro expansion, so the field is intentionally tagged
+    // as potentially unused.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 

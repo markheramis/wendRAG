@@ -318,7 +318,10 @@ pub fn default_keys_path() -> Option<PathBuf> {
 /// long (default: 69 chars, `wrag_` + 64 hex).
 pub fn generate_key_material() -> Result<String, AuthError> {
     let mut bytes = [0u8; KEY_RANDOM_BYTES];
-    getrandom::getrandom(&mut bytes).map_err(|e| AuthError::Random(e.to_string()))?;
+    // `getrandom::fill` replaced `getrandom::getrandom` in the 0.3 API; the
+    // behaviour is identical — block until the OS CSPRNG can return
+    // high-quality entropy, then fill the buffer in-place.
+    getrandom::fill(&mut bytes).map_err(|e| AuthError::Random(e.to_string()))?;
 
     let mut out = String::with_capacity(KEY_PREFIX.len() + bytes.len() * 2);
     out.push_str(KEY_PREFIX);

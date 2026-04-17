@@ -4,6 +4,42 @@ All notable changes to **wendRAG** are documented in this file. The format follo
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-17
+
+Dependency refresh. No behavioural changes; every previously passing
+test (133) continues to pass, and `cargo clippy --all-targets -- -D
+warnings` remains clean.
+
+### Changed
+
+- Bumped direct dependencies to their current releases:
+  - `rmcp` 1.3 → 1.5
+  - `axum` 0.8.8 → 0.8.9 (lockfile)
+  - `clap` 4.6.0 → 4.6.1 (lockfile)
+  - `html-to-markdown-rs` 3.1.0 → 3.2
+  - `tokio` 1.51 → 1.52 (lockfile)
+  - `uuid` 1.23.0 → 1.23.1 (lockfile)
+  - `libc` 0.2.184 → 0.2.185 (dev, lockfile)
+  - `getrandom` 0.2 → 0.4 — call site updated from
+    `getrandom::getrandom(&mut buf)` to `getrandom::fill(&mut buf)`
+    (single call in `src/auth.rs`).
+  - `dirs` 5 → 6 — `home_dir()` signature unchanged, no code edits
+    needed.
+  - OpenTelemetry stack bumped as a coherent set:
+    - `opentelemetry` 0.29 → 0.31
+    - `opentelemetry-otlp` 0.29 → 0.31
+    - `opentelemetry_sdk` 0.29 → 0.31
+    - `tracing-opentelemetry` 0.30 → 0.32
+
+### Fixed
+
+- Suppressed a spurious `dead_code` warning on `WendRagServer.tool_router`
+  introduced by the `rmcp` 1.5 macro expansion (the field is consumed
+  via the `#[tool_handler]`-generated dispatch code, which rustc's
+  lint cannot see through).
+
+---
+
 ## [0.2.0] - 2026-04-17
 
 Consolidated release covering audit remediation, API key authentication, chunk
@@ -138,5 +174,6 @@ Initial feature-complete release squashed from all prior commits.
   shutdown on SIGTERM / Ctrl-C.
 - Docker Compose setup and a full EC2 + PostgreSQL + Ollama setup guide.
 
+[0.2.1]: https://semver.org/spec/v2.0.0.html
 [0.2.0]: https://semver.org/spec/v2.0.0.html
 [0.1.0]: https://semver.org/spec/v2.0.0.html
